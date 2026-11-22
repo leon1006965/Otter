@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Otter
+GenericName=Samsung download-mode driver
+Comment=Flash Samsung phones in Download mode with safety gates
+Exec=/usr/local/bin/otter
+Icon=phone
+Terminal=false
+Categories=Utility;HardwareSettings;Qt;
+Keywords=Odin;Samsung;Galaxy;firmware;recovery;flash;
+StartupNotify=true

@@ -1,0 +1,755 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+Otter - a GTK3 front end for the odin3-linux Samsung download-mode driver,
+laid out the way Odin3 itself is: pick files, tick options, press Start,
+watch the log.
+
+Otter contains no protocol code.  Every action is a subprocess call to
+`odin3-linux`, so all framing and every safety gate lives in one place and the
+GUI cannot route around it.
+
+Flow (the phone allows ONE session per Download-mode entry):
+
+   1. Refresh   - find the device
+   2. Probe     - read-only session: identity + device PIT     [phone]
+   3. Pick BL / AP / CP / CSC / UMS
+   4. Start     - runs every gate offline first, shows you what will be
+                  written, and only then asks the phone            [phone]
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk, Pango
+
+# slot key -> tooltip (same order as Odin3's button column)
+SLOTS = [("BL", "Bootloader"), ("AP", "System / PDA"), ("CP", "Modem"),
+         ("CSC", "Consumer software"), ("UMS", "User / patch")]
+
+# the four options Odin3 shows, all OFF by default
+OPTIONS = [("repartition", "Re-Partition"), ("reboot", "Auto Reboot"),
+           ("lock", "Flash Lock"), ("erase", "Erase")]
+
+# gate overrides - hidden behind "Advanced", because they exist only to
+# bypass a refusal you have decided is wrong
+ADVANCED = [("allow_critical", "Allow boot-critical partitions",
+             "BOOTLOADER / TZSW / KEYSTORAGE / EFS ..."),
+            ("allow_oversize", "Allow image bigger than the partition", ""),
+            ("allow_model", "Allow a file named for another model", ""),
+            ("allow_duplicate", "Allow two files for one partition", "")]
+
+
+STATE_FILE = os.path.join(GLib.get_user_cache_dir(), "otter-state")
+
+
+def find_driver():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.environ.get("OTTER_DRIVER"),
+                 os.path.join(here, "odin3-linux"),
+                 os.path.join(os.path.dirname(here), "odin3-linux"),
+                 shutil.which("odin3-linux")):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+class Slot:
+    """One BL/AP/CP/CSC/UMS row: checkbox + path + browse.
+
+    Exposes get()/set() so callers (and the test) treat it like a plain
+    file field.
+    """
+
+    def __init__(self, key, entry, check, clear):
+        self.key, self.entry, self.check, self.clear = key, entry, check, clear
+        self.path = None
+
+    def get(self):
+        p = self.entry.get_text().strip()
+        if not p or not self.check.get_active():
+            return None
+        return p
+
+    def set(self, path):
+        self.path = path
+        self.entry.set_text(path or "")
+        self.check.set_sensitive(bool(path))
+        self.check.set_active(bool(path))
+        self.clear.set_sensitive(bool(path))
+        self.entry.set_placeholder_text("no file selected")
+        if hasattr(self, "on_change"):
+            self.on_change()
+
+
+class Otter(Gtk.Window):
+    # Shadow margin the CSD surface reserves but does not draw.  Measured from
+    # screenshots of the real window; see README before touching this.
+    CSD_OVERHEAD = 158
+
+    def __init__(self):
+        super().__init__(title="Otter")
+        self.set_border_width(10)
+
+        req_w, req_h = 900, 780
+        try:
+            wa = Gdk.Display.get_default().get_monitor(0).get_workarea()
+            if wa.height > 200 and wa.width > 400:
+                req_w = min(900, wa.width - 20)
+                req_h = min(780, wa.height - 60)
+        except Exception:
+            pass
+        self._req_h = req_h
+        self.set_default_size(req_w, req_h)
+
+        self.driver = find_driver()
+        self.proc = None
+        self.running = False
+        self.rec = {}
+        self.plan_rows = []
+        self.identity = ""
+        self.serial_path = ""
+        self.devlist = []
+        self.kind = None
+        self._pulse = None
+        self._have_progress = False
+        self._loke_fail = False
+        self.pit_path = os.path.join(GLib.get_user_cache_dir(), "otter-device.pit")
+
+        header = Gtk.HeaderBar(title="Otter")
+        header.set_show_close_button(True)
+        header.set_subtitle("Samsung Odin download-mode driver")
+        self.header = header
+        self.set_titlebar(header)
+        # only quit a loop that is actually running (the test harness builds
+        # and destroys a window without Gtk.main())
+        self.connect("destroy", lambda *_: Gtk.main_quit() if Gtk.main_level() > 0 else None)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.add(outer)
+
+        # ---- one thin warning line, the only prose left on screen ---------
+        warn = Gtk.Box(spacing=6)
+        warn.pack_start(Gtk.Image.new_from_icon_name("dialog-warning",
+                                                     Gtk.IconSize.BUTTON),
+                        False, False, 0)
+        wl = Gtk.Label(xalign=0, wrap=False)
+        wl.set_markup("<small>One session per Download-mode entry - "
+                      "re-enter Download mode before pressing Start.</small>")
+        warn.pack_start(wl, True, True, 0)
+        if not self.driver:
+            wl.set_markup("<small><b>odin3-linux not found</b> - set OTTER_DRIVER "
+                          "or run <tt>make</tt></small>")
+        outer.pack_start(warn, False, False, 0)
+
+        # ---- device row ---------------------------------------------------
+        dev = Gtk.Box(spacing=6)
+        self.transport = Gtk.ComboBoxText()
+        # "auto" is the default on purpose: a production user should not have
+        # to know whether their model shows up as a tty or as a bulk device.
+        self.transport.append("auto", "Auto")
+        self.transport.append("usb", "USB bulk")
+        self.transport.append("serial", "Serial / tty")
+        self.transport.set_active_id("auto")
+        self.transport.connect("changed", lambda *_: self._update_actions())
+        dev.pack_start(self.transport, False, False, 0)
+        self.vid = Gtk.Entry(text="04e8"); self.vid.set_width_chars(6)
+        # no PID default: 685d is one specific model. Empty means "detect".
+        self.pid = Gtk.Entry(); self.pid.set_width_chars(7)
+        self.pid.set_placeholder_text("auto")
+        dev.pack_start(self.vid, False, False, 0)
+        dev.pack_start(Gtk.Label(label=":"), False, False, 0)
+        dev.pack_start(self.pid, False, False, 0)
+        self.devs = Gtk.ComboBoxText(); self.devs.set_size_request(130, -1)
+        self.devs.connect("changed", self._on_dev_changed)
+        dev.pack_start(self.devs, False, False, 0)
+        b = Gtk.Button(label="Refresh"); b.connect("clicked", lambda *_: self._run_list())
+        dev.pack_start(b, False, False, 0)
+        b = Gtk.Button(label="Probe")
+        b.set_tooltip_text("Read-only: identify the phone and save its partition "
+                           "table. Costs the phone's one session.")
+        b.connect("clicked", lambda *_: self._run_probe())
+        dev.pack_start(b, False, False, 0)
+        self.identity_lbl = Gtk.Label(xalign=1, ellipsize=Pango.EllipsizeMode.END)
+        self.identity_lbl.set_max_width_chars(22)
+        self.identity_lbl.set_markup("<i>not probed</i>")
+        dev.pack_end(self.identity_lbl, False, False, 0)
+        outer.pack_start(dev, False, False, 0)
+
+        # ---- the slot column ---------------------------------------------
+        grid = Gtk.Grid(column_spacing=6, row_spacing=4)
+        grid.set_margin_top(4)
+        self.filers, self.checks = {}, {}
+        for i, (key, hint) in enumerate(SLOTS):
+            chk = Gtk.CheckButton(label=key)
+            chk.set_sensitive(False)
+            chk.set_tooltip_text(hint)
+            ent = Gtk.Entry(); ent.set_hexpand(True)
+            ent.set_editable(False)          # browse only, like Odin3
+            ent.set_placeholder_text("no file selected")
+            br = Gtk.Button(label="…"); br.set_tooltip_text("Choose " + key + " file")
+            cl = Gtk.Button(label="×"); cl.set_sensitive(False)
+            s = Slot(key, ent, chk, cl)
+            s.on_change = self._slot_changed
+            br.connect("clicked", lambda w, k=key: self._pick(k))
+            cl.connect("clicked", lambda w, k=key: self.filers[k].set(None))
+            ent.connect("changed", lambda w, k=key: self._slot_changed())
+            grid.attach(chk,  0, i, 1, 1)
+            grid.attach(ent,  1, i, 1, 1)
+            grid.attach(br,   2, i, 1, 1)
+            grid.attach(cl,   3, i, 1, 1)
+            self.filers[key] = s
+            self.checks[key] = chk
+        outer.pack_start(grid, False, False, 0)
+
+        # ---- options row (Odin3's four) -----------------------------------
+        opt = Gtk.Box(spacing=14)
+        opt.set_margin_top(4)
+        self.flags = {}
+        for key, label in OPTIONS:
+            cb = Gtk.CheckButton(label=label)
+            cb.connect("toggled", lambda *_: self._opt_changed())
+            opt.pack_start(cb, False, False, 0)
+            self.flags[key] = cb
+        outer.pack_start(opt, False, False, 0)
+
+        self.pit_row = Gtk.Box(spacing=6)
+        self.pit_row.set_no_show_all(True)
+        self.pit_row.set_visible(False)
+        self.pit_row.pack_start(Gtk.Label(label="PIT file:", xalign=0), False, False, 0)
+        self.repart_pit = Gtk.Entry(); self.repart_pit.set_hexpand(True)
+        self.pit_row.pack_start(self.repart_pit, True, True, 0)
+        pb = Gtk.Button(label="…")
+        pb.connect("clicked", lambda *_: self._pick_pit())
+        self.pit_row.pack_start(pb, False, False, 0)
+        outer.pack_start(self.pit_row, False, False, 0)
+
+        adv = Gtk.Expander(label="Advanced…")
+        adv.set_margin_top(2)
+        advbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        advbox.set_border_width(4)
+        for key, label, tip in ADVANCED:
+            cb = Gtk.CheckButton(label=label + ("  —  " + tip if tip else ""))
+            advbox.pack_start(cb, False, False, 0)
+            self.flags[key] = cb
+        adv.add(advbox)
+        outer.pack_start(adv, False, False, 0)
+
+        # ---- progress + Start ---------------------------------------------
+        pr = Gtk.Box(spacing=10)
+        pr.set_margin_top(6)
+        try:
+            css = Gtk.CssProvider()
+            css.load_from_data(b"progressbar trough, progressbar progress "
+                                b"{ min-height: 12px; border-radius: 4px; }")
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), css,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        except Exception:
+            pass
+        self.bar = Gtk.ProgressBar()
+        self.bar.set_hexpand(True)
+        self.bar.set_show_text(True)
+        self.bar.set_text("idle")
+        pr.pack_start(self.bar, True, True, 0)
+        self.bytes_lbl = Gtk.Label(xalign=1)
+        self.bytes_lbl.set_width_chars(22)
+        pr.pack_start(self.bytes_lbl, False, False, 0)
+        self.btn_start = Gtk.Button(label="Start")
+        self.btn_start.get_style_context().add_class("suggested-action")
+        self.btn_start.set_size_request(140, 36)
+        self.btn_start.connect("clicked", lambda *_: self._on_start())
+        pr.pack_start(self.btn_start, False, False, 0)
+        outer.pack_start(pr, False, False, 0)
+
+        # ---- log: the biggest thing on screen, like Odin3 -----------------
+        frame = Gtk.Frame(label="Log")
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
+        fb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        fb.set_border_width(4)
+        self.logbuf = Gtk.TextBuffer()
+        self.logbuf.create_tag("err", foreground="#c01c28", weight=Pango.Weight.BOLD)
+        self.logbuf.create_tag("warn", foreground="#a2734c")
+        self.logbuf.create_tag("ok", foreground="#2ec27e")
+        self.logbuf.create_tag("cmd", foreground="#3584e4", weight=Pango.Weight.BOLD)
+        view = Gtk.TextView(buffer=self.logbuf, editable=False, cursor_visible=False)
+        view.set_monospace(True)
+        self._logview = view
+        sw = Gtk.ScrolledWindow()
+        sw.set_min_content_height(160)
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(view)
+        fb.add(sw)
+        frame.add(fb)
+        outer.pack_start(frame, True, True, 0)
+
+        cached = self._load_state()
+        if cached:
+            self._set_status("%s (from the last probe) - re-enter Download mode "
+                             "before Start" % cached)
+        else:
+            self._set_status("Samsung Odin download-mode driver")
+        self._update_actions()
+
+    # ----------------------------------------------------------------- sizing
+
+    def _fit_to_screen(self):
+        """Size the window so its visible bottom sits just above the panel."""
+        try:
+            wa = Gdk.Display.get_default().get_monitor(0).get_workarea()
+        except Exception:
+            return
+        want = min(780, wa.height - 40 - self.CSD_OVERHEAD)
+        want = max(want, self.get_preferred_height()[0])
+        if want == self._req_h:
+            return
+        self._req_h = want
+        self.resize(min(900, wa.width - 20), want)
+
+    def _load_state(self):
+        """Restore the identity from the last probe.
+
+        A phone accepts ONE session per Download-mode entry, so forcing a new
+        probe after every restart is what made Start impossible to reach in
+        the same take.  The CLI still compares --confirm against the *live*
+        device identity, so a stale value can only make the flash refuse - it
+        can never make it write to the wrong phone.
+        """
+        try:
+            with open(STATE_FILE) as f:
+                for line in f:
+                    if line.startswith("identity="):
+                        v = line.split("=", 1)[1].strip()
+                        if v and v != "-":
+                            self.identity = v
+                            self.identity_lbl.set_markup(
+                                "<b>%s</b> <i>(cached)</i>" % esc(v))
+                            return v
+        except OSError:
+            pass
+        return ""
+
+    def _save_state(self):
+        try:
+            with open(STATE_FILE, "w") as f:
+                f.write("identity=%s\n" % (self.identity or "-"))
+        except OSError as e:
+            self._log("[otter] could not save state: %s" % e, "warn")
+
+    def _popup(self, title, primary, secondary, mtype=Gtk.MessageType.INFO):
+        """Modal note.  Never blocks anything: it only explains what to do."""
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=mtype,
+                              buttons=Gtk.ButtonsType.OK)
+        d.set_title(title)
+        d.set_markup("<b>%s</b>\n\n%s" % (esc(primary), esc(secondary)))
+        d.run()
+        d.destroy()
+
+    def _popup_after_probe(self):
+        self._popup(
+            "Probe complete",
+            "Probed %s - device PIT saved." % (self.identity or "?"),
+            "The phone has just used its ONE session for this Download-mode "
+            "entry, so pressing Start right now would fail.\n\n"
+            "Power the phone off and re-enter Download mode, then press "
+            "Start.\n\n"
+            "The identity and partition table are remembered - you will not "
+            "be asked to Probe again.",
+            Gtk.MessageType.WARNING)
+
+    def _popup_session_lost(self):
+        self._popup(
+            "The phone will not open a session",
+            "No \"LOKE\" - this Download-mode entry has already been used.",
+            "Power the phone off and re-enter Download mode, then press "
+            "Start again.\n\nNothing was written to the phone.",
+            Gtk.MessageType.WARNING)
+
+    def _popup_flash_done(self):
+        self._popup(
+            "Flash complete",
+            "Everything was written and the session was closed cleanly.",
+            "The phone is still in Download mode. If you want to flash "
+            "again, power it off and re-enter Download mode first.",
+            Gtk.MessageType.INFO)
+
+    def _set_status(self, text):
+        if getattr(self, "header", None):
+            self.header.set_subtitle(text)
+
+    # ------------------------------------------------------------ file pick
+
+    def _pick(self, key):
+        dlg = Gtk.FileChooserDialog(title="Choose a " + key + " file",
+                                    action=Gtk.FileChooserAction.OPEN)
+        dlg.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("_Open", Gtk.ResponseType.ACCEPT)
+        cur = self.filers[key].entry.get_text()
+        if cur and os.path.isfile(cur):
+            dlg.set_filename(cur)
+        resp = dlg.run()
+        fn = dlg.get_filename() if resp == Gtk.ResponseType.ACCEPT else None
+        dlg.destroy()
+        if fn:
+            self.filers[key].set(fn)
+            self._log("$ " + os.path.basename(fn) + "  ->  " + key)
+
+    def _pick_pit(self):
+        dlg = Gtk.FileChooserDialog(title="Choose a PIT",
+                                    action=Gtk.FileChooserAction.OPEN)
+        dlg.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("_Open", Gtk.ResponseType.ACCEPT)
+        resp = dlg.run()
+        fn = dlg.get_filename() if resp == Gtk.ResponseType.ACCEPT else None
+        dlg.destroy()
+        if fn:
+            self.repart_pit.set_text(fn)
+
+    def _slot_changed(self):
+        self.plan_rows = []          # any change invalidates a previewed plan
+        self._update_actions()
+
+    def _opt_changed(self):
+        self.pit_row.set_visible(self.flags["repartition"].get_active())
+        self.plan_rows = []
+
+    # --------------------------------------------------------------- logging
+
+    def _log(self, line, tag=None):
+        it = self.logbuf.get_end_iter()
+        if tag:
+            self.logbuf.insert_with_tags_by_name(it, line + "\n", tag)
+        else:
+            self.logbuf.insert(it, line + "\n")
+        end = self.logbuf.get_end_iter()
+        mark = self.logbuf.create_mark(None, end, False)
+        # keep the tail visible if the user is not scrolling
+        tv = self._logview if getattr(self, "_logview", None) else None
+        if tv:
+            tv.scroll_to_mark(mark, 0.0, False, 0.0, 1.0)
+        self.logbuf.delete_mark(mark)
+
+    def _tag_for(self, line):
+        if line.startswith("error:") or "refus" in line or "failed" in line:
+            return "err"
+        if line.startswith(("[usb]", "[proto]", "[pit]", "[otter]", "warning")):
+            return "warn"
+        if line.startswith("OTTER"):
+            return None
+        return None
+
+    # ------------------------------------------------------------- plumbing
+
+    def _run(self, kind, args):
+        if self.running:
+            return
+        if not self.driver:
+            self._log("error: odin3-linux binary not found", "err")
+            return
+        self.kind = kind
+        self.rec = {}
+        self._loke_fail = False
+        if kind == "list":
+            self.devlist = []
+        self.plan_rows = []          # always recompute, never reuse
+        self.running = True
+        self._have_progress = False
+        self._update_actions()
+        self._start_pulse()
+        self._set_status("working…")
+        argv = [self.driver] + args + ["--machine"]
+        self._log("$ " + " ".join(os.path.basename(a) for a in argv), "cmd")
+        threading.Thread(target=self._worker, args=(argv,), daemon=True).start()
+
+    def _worker(self, argv):
+        try:
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except Exception as e:
+            GLib.idle_add(self._log, "error: " + str(e), "err")
+            GLib.idle_add(self._done, 1)
+            return
+        self.proc = p
+        for line in p.stdout:
+            GLib.idle_add(self._line, line.rstrip("\n"))
+        rc = p.wait()
+        GLib.idle_add(self._done, rc)
+
+    def _line(self, line):
+        if line.startswith("OTTER\t"):
+            parts = line.split("\t")
+            key = parts[1]
+            if key == "PLAN":
+                self.plan_rows.append(parts[2:])
+            elif key == "PROGRESS" and len(parts) >= 4:
+                try:
+                    done, total = int(parts[2]), int(parts[3])
+                except ValueError:
+                    return False
+                if total > 0:
+                    self._have_progress = True
+                    f = min(1.0, done / total)
+                    self.bar.set_fraction(f)
+                    self.bar.set_text("%d%%" % int(f * 100))
+                    self.bytes_lbl.set_text("%s / %s" % (fmt(done), fmt(total)))
+            else:
+                self.rec[key] = "\t".join(parts[2:])
+            return False
+        if line.startswith('[proto] handshake: no "LOKE"'):
+            self._loke_fail = True
+        if self.kind == "list":
+            m = re.match(r"\s+([0-9a-f]{4}):([0-9a-f]{4})\b", line)
+            if m:
+                self.devlist.append(("usb", m.group(1), m.group(2)))
+            else:
+                m = re.match(r"\s+(/dev/tty(?:ACM|USB)\d+)\b", line)
+                if m:
+                    self.devlist.append(("serial", m.group(1), ""))
+        self._log(line, self._tag_for(line))
+        return False
+
+    def _done(self, rc):
+        self.running = False
+        self.proc = None
+        self._stop_pulse()
+        kind = self.kind
+
+        if rc == 0:
+            self._log("[otter] ok (exit 0)", "ok")
+            if kind == "list":
+                self._fill_devices()
+                self._set_status("device list refreshed")
+            elif kind == "probe":
+                self.identity = self.rec.get("IDENTITY", "")
+                n = self.rec.get("PITCOUNT", "?")
+                self.identity_lbl.set_markup("<b>%s</b>" % esc(self.identity or "?"))
+                self._save_state()
+                self._log("[otter] probed %s, device PIT saved (%s entries)"
+                          % (self.identity or "?", n), "ok")
+                self._set_status("%s - re-enter Download mode before Start"
+                                 % (self.identity or "?"))
+                self.bar.set_fraction(0); self.bar.set_text("idle")
+                self.bytes_lbl.set_text("")
+                self._popup_after_probe()
+            elif kind == "preflight":
+                self._log("[otter] every pre-flight gate passed", "ok")
+                self._set_status("plan OK - confirm to continue")
+                self._ask_then_flash()
+            elif kind == "flash":
+                self.identity = self.rec.get("IDENTITY") or self.identity
+                self.bar.set_fraction(1.0); self.bar.set_text("done")
+                self._log("[otter] flash complete", "ok")
+                self._set_status("flash complete")
+                self._popup_flash_done()
+            elif kind == "plan":
+                self._set_status("plan checked")
+        else:
+            self._log("[otter] failed (exit %s) - see the log; nothing further "
+                      "was sent" % rc, "err")
+            self._set_status("failed - see the log")
+            if self.bar.get_fraction() < 1.0:
+                self.bar.set_text("failed")
+            if kind == "preflight":
+                self._log("[otter] Start cancelled: the gates above refused",
+                          "err")
+            elif kind == "flash" and self._loke_fail:
+                self._popup_session_lost()
+        self._update_actions()
+        return False
+
+    # ------------------------------------------------------------ devices
+
+    def _fill_devices(self):
+        self.devs.remove_all()
+        usb = [d for d in self.devlist if d[0] == "usb"]
+        ser = [d for d in self.devlist if d[0] == "serial"]
+        for _, v, p in usb:
+            self.devs.append_text("%s:%s" % (v, p))
+        for _, path, _ in ser:
+            self.devs.append_text(path)
+        if usb:
+            self.devs.set_active(0)
+            self.vid.set_text(usb[0][1])
+            self.pid.set_text(usb[0][2])
+            self.transport.set_active_id("usb")
+        elif ser:
+            self.devs.set_active(0)
+            self._on_dev_changed(self.devs)
+        else:
+            self._log("[otter] no device found - is the phone in Download mode?",
+                      "warn")
+
+    def _on_dev_changed(self, combo):
+        v = combo.get_active_text() or ""
+        if v.startswith("/dev/"):
+            self.serial_path = v
+            self.transport.set_active_id("serial")
+        elif re.match(r"^[0-9a-f]{4}:[0-9a-f]{4}$", v):
+            self.serial_path = ""
+            self.vid.set_text(v[:4])
+            self.pid.set_text(v[5:])
+            self.transport.set_active_id("usb")
+
+    # ------------------------------------------------------------- commands
+
+    def _transport_args(self):
+        mode = self.transport.get_active_id() or "auto"
+        if mode == "serial":
+            out = ["--transport", "serial"]
+            if self.serial_path:
+                out += ["--device", self.serial_path]
+            return out
+        if mode == "auto":
+            return []                      # let the CLI discover everything
+        out = ["--transport", "usb"]
+        if self.vid.get_text().strip():
+            out += ["--vid", self.vid.get_text().strip()]
+        if self.pid.get_text().strip():
+            out += ["--pid", self.pid.get_text().strip()]
+        return out
+
+    def _slot_args(self):
+        out = []
+        for key, _ in SLOTS:
+            p = self.filers[key].get()
+            if p:
+                out += ["--" + key.lower(), p]
+        return out
+
+    def _flag_args(self):
+        out = []
+        if self.flags["repartition"].get_active():
+            out.append("--repartition")
+            p = self.repart_pit.get_text().strip()
+            if p:
+                out += ["--pit", p]
+        for k, cli in (("reboot", "--reboot"), ("lock", "--lock"),
+                       ("erase", "--erase"),
+                       ("allow_critical", "--allow-critical-partitions"),
+                       ("allow_oversize", "--allow-oversize"),
+                       ("allow_model", "--allow-model-mismatch"),
+                       ("allow_duplicate", "--allow-duplicate-targets")):
+            if self.flags[k].get_active():
+                out.append(cli)
+        return out
+
+    def _run_list(self):
+        self._run("list", ["list"])
+
+    def _run_probe(self):
+        self._run("probe", ["probe"] + self._transport_args() +
+                  ["--save-pit", self.pit_path])
+
+    def _on_start(self):
+        if self.running:
+            return
+        if not self._slot_args():
+            self._log("error: choose at least one file first", "err")
+            return
+        if not self.identity:
+            self._log("error: press Probe first - the confirm token is the "
+                      "device identity and it is not known yet", "err")
+            return
+        if self.flags["repartition"].get_active() \
+                and not self.repart_pit.get_text().strip():
+            self._log("error: Re-Partition is ticked but no PIT file is chosen",
+                      "err")
+            return
+        if os.path.isfile(self.pit_path):
+            # Run every gate offline first: if anything is refused we never
+            # get as far as the confirmation dialog, let alone the phone.
+            self._run("preflight", ["plan"] + self._slot_args() +
+                      ["--pit", self.pit_path] + self._flag_args())
+        else:
+            self._ask_then_flash()
+
+    def _ask_then_flash(self):
+        rows = self.plan_rows
+        if rows:
+            body = "\n".join("%s  ->  %s   (%s bytes)"
+                             % (r[1], r[3], f"{int(r[4]):,}") for r in rows)
+        else:
+            body = "\n".join(os.path.basename(p) for p in _paths(self))
+            body += "\n\n(no saved device PIT, so no partition preview)"
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True,
+                                message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK_CANCEL)
+        dlg.set_title("Start flash")
+        dlg.set_markup("<b>Write to %s ?</b>\n\n%s\n\n"
+                       "The phone must be in Download mode."
+                       % (esc(self.identity), esc(body)))
+        if dlg.run() != Gtk.ResponseType.OK:
+            dlg.destroy()
+            self._set_status("cancelled - nothing was written")
+            return
+        dlg.destroy()
+        self._run("flash", ["flash"] + self._slot_args() + self._transport_args() +
+                  ["--flash", "--confirm", self.identity,
+                   "--expect-model", self.identity] + self._flag_args())
+
+    # --------------------------------------------------------------- state
+
+    def _update_actions(self):
+        if not hasattr(self, "btn_start"):
+            return
+        ok = (not self.running and bool(self.driver) and bool(self._slot_args())
+              and bool(self.identity))
+        self.btn_start.set_sensitive(ok)
+        self.btn_start.set_label("Flashing…" if self.running else "Start")
+
+    def _start_pulse(self):
+        if self._pulse:
+            return
+        self._have_progress = False
+
+        def tick():
+            if not self.running or self._have_progress:
+                self._pulse = None
+                return False
+            self.bar.pulse()
+            return True
+        self._pulse = GLib.timeout_add(90, tick)
+
+    def _stop_pulse(self):
+        if self._pulse:
+            GLib.source_remove(self._pulse)
+            self._pulse = None
+
+
+def fmt(n):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return ("%.1f %s" % (n, unit)) if unit != "B" else ("%d B" % n)
+        n /= 1024.0
+    return "%d B" % n
+
+
+def esc(s):
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _paths(win):
+    return [win.filers[k].get() for k, _ in SLOTS if win.filers[k].get()]
+
+
+def main():
+    win = Otter()
+    win.show_all()
+    # after the first layout pass, so real allocations exist to measure
+    GLib.timeout_add(250, lambda: (win._fit_to_screen(), False)[1])
+    GLib.timeout_add(800, lambda: (win._fit_to_screen(), False)[1])
+    # find the phone on our own - Odin3 shows the COM port without being asked
+    GLib.timeout_add(500, lambda: (win._run_list(), False)[1])
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

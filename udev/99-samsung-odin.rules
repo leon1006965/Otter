@@ -1,0 +1,12 @@
+# Samsung download-mode devices (VID 04e8) - allow non-root access.
+#
+# Two shapes are covered:
+#   * the CDC-ACM / serial node Odin3 itself talks to (this is the path the
+#     shipping tool uses: it opens a COM port discovered through
+#     HARDWARE\DEVICEMAP\SERIALCOMM)
+#   * the raw vendor interface, for --transport usb
+#
+# Reload with:  sudo udevadm control --reload-rules && sudo udevadm trigger
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", MODE="0660", TAG+="uaccess", GROUP="plugdev"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="04e8", MODE="0660", TAG+="uaccess", GROUP="plugdev"
