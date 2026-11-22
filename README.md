@@ -69,7 +69,8 @@ yourself.
   uses it. Nothing assumes `685d` or any other single model.
 * **Heuristics warn, they do not block.** Anything inferred from a file name is
   a warning by default. Only what comes straight out of `SS_DL.dll` — an
-  unmapped member, an unusable chunk size, an LZ4 member, a broken archive, or
+  unmapped member, an unusable chunk size, an LZ4 container we cannot
+  decode, a broken archive, or
   a request id the device did not echo — is a hard stop.
 * **Per-model hardening is configuration, not code:** `~/.config/odin3-critical`.
 
@@ -167,7 +168,7 @@ the following hold.
 | image must fit the partition | `size ≤ raw+24 × 4096`, the PIT's capacity field (unit confirmed by the successful test flash) — overridable with `--allow-oversize` |
 | file name vs device model | when **both** the input filename and the device identity carry a Samsung model token they must agree (`AP_G991B…` vs `SM-G991B`). **Warns by default** — it is a heuristic read off a file name, and a false positive must never block a model we have never seen. `--strict-model` makes it a refusal, `--expect-model` pins the device, `--allow-model-mismatch` silences it. If neither side carries a token (most custom recoveries) nothing is checked |
 | boot-critical partitions | boot-chain partitions are denied by default. The shipped names come from one phone's PIT, so **other models add their own** in `~/.config/odin3-critical` (one name per line, `#` starts a comment) instead of us guessing names we have never seen |
-| no LZ4-compressed members | Odin decompresses these before sending; this driver does not, so it refuses rather than writing compressed garbage |
+| LZ4 members are decompressed, not refused | the codec is the reference implementation vendored from `github.com/lz4/lz4` **v1.11.1** (BSD-2-Clause, `third_party/lz4/`); framing is implemented here for both the frame (`04 22 4d 18`) and legacy (`02 21 4c 18`) containers. A container with **no recognisable header** — a raw LZ4 block — is refused, because its member boundaries cannot be found without guessing |
 
 Three destructive operations are **off by default** and each needs its own flag
 on top of `--flash`:
@@ -280,6 +281,13 @@ be re-verified against the phone.
 ---
 
 ## Known limitations
+
+* **LZ4 members are decoded twice**: once to learn the uncompressed size (the
+  `is_last` flag, the progress total and the fits-the-partition gate all need
+  it) and once to send. That is correct and memory-safe — an 11 GB `super.img`
+  never sits in RAM — but a frame that carried a content-size field could skip
+  the first pass. Neither of the two containers we exercised does.
+
 
 * The wire protocol is now verified end-to-end, **including a real write**
   (see above). Only one image/partition combination has been exercised, so

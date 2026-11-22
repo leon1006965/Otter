@@ -1,10 +1,14 @@
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
-CFLAGS  += -Iinclude
+CFLAGS  += -Iinclude -Ithird_party/lz4
 LDLIBS  += -lusb-1.0
 
-SRCS := src/main.c src/protocol.c src/transport.c src/pit.c src/tar.c
-OBJS := $(SRCS:.c=.o)
+SRCS := src/main.c src/protocol.c src/transport.c src/pit.c src/tar.c src/lz4dec.c
+# Vendored reference implementation (github.com/lz4/lz4, BSD-2-Clause).
+VEND := third_party/lz4/lz4.c third_party/lz4/lz4frame.c \
+	third_party/lz4/lz4hc.c third_party/lz4/xxhash.c
+
+OBJS := $(SRCS:.c=.o) $(VEND:.c=.o)
 BINDIR := $(DESTDIR)/usr/local/bin
 
 all: odin3-linux
@@ -12,8 +16,12 @@ all: odin3-linux
 odin3-linux: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
+# Our code: full warning set.  Third-party code: build it, don't police it.
 %.o: %.c include/odin.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+third_party/lz4/%.o: third_party/lz4/%.c
+	$(CC) -std=c11 -O2 -Ithird_party/lz4 -c -o $@ $<
 
 # Otter is a Python/GTK front end that drives this binary; it is installed
 # alongside it so `find_driver()` finds it without OTTER_DRIVER.
@@ -27,12 +35,12 @@ install: odin3-linux
 # Offline tests only - no phone required.
 test: odin3-linux
 	python3 tests/make_fixtures.py >/dev/null
-	@for t in test bad zerodiv crit big lz4 lz4legacy lz4name md5; do \
+	@for t in test bad zerodiv crit big lz4 lz4legacy lz4name md5 lz4ok lz4oklegacy; do \
 		f=tests/$$t.tar; [ -f "$$f" ] || f=tests/$$t.tar.md5; \
-		exp=OK; case $$t in test|md5) exp=OK;; *) exp=NO;; esac; \
+		exp=OK; case $$t in test|md5|lz4ok|lz4oklegacy) exp=OK;; *) exp=NO;; esac; \
 		if ./odin3-linux plan --ap $$f --pit tests/test.pit >/dev/null 2>&1; then got=OK; else got=NO; fi; \
-		if [ "$$exp" = "$$got" ]; then echo "  pass  $$t.tar ($$got)"; \
-		else echo "  FAIL  $$t.tar expected $$exp got $$got"; exit 1; fi; \
+		if [ "$$exp" = "$$got" ]; then echo "  pass  $$t ($$got)"; \
+		else echo "  FAIL  $$t expected $$exp got $$got"; exit 1; fi; \
 	done
 	@./odin3-linux plan --ap tests/crit.tar --pit tests/test.pit --allow-critical-partitions >/dev/null 2>&1 \
 		&& echo "  pass  critical override" || { echo "  FAIL  critical override"; exit 1; }

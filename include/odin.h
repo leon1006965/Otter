@@ -201,11 +201,38 @@ uint64_t pit_start_bytes(const pit_entry *e);
 /* --------------------------------------------------------------- tar object */
 typedef struct {
     char     name[256];
-    uint64_t size;
+    uint64_t size;           /* bytes on disk (compressed when compressed)    */
     uint32_t hdr_offset;     /* byte offset of this 512-byte header           */
     uint32_t data_offset;    /* byte offset of the payload                    */
     bool     is_pit;         /* member literally named "PIT"                  */
+    bool     compressed;     /* payload is LZ4 inside the tar                 */
+    uint64_t unc_size;       /* bytes to send; == size when not compressed    */
 } tar_member;
+
+/* ---- LZ4 (codec vendored from github.com/lz4/lz4 v1.11.1, BSD-2-Clause) -- */
+#define LZ4_KIND_NONE    0
+#define LZ4_KIND_FRAME   1
+#define LZ4_KIND_LEGACY  2
+
+typedef struct lz4_stream {
+    int      fd;
+    uint64_t base;          /* file offset of the payload                     */
+    uint64_t comp_len;      /* compressed length (the tar member size)        */
+    uint64_t comp_pos;      /* compressed bytes consumed so far               */
+    int      kind;
+    int      eof;
+    void    *fctx;          /* LZ4F_dctx* for the frame format               */
+    uint8_t *in;   size_t in_cap, in_len, in_pos;
+    uint8_t *pend; size_t pend_cap, pend_len, pend_pos;
+} lz4_stream;
+
+/* 1 = compressed, 0 = raw, -1 = could not read */
+int  lz4_looks_compressed(int fd, uint64_t off, const char *name);
+int  lz4_stream_open(lz4_stream *s, int fd, uint64_t base, uint64_t len,
+                     uint64_t *known_size, char *err, size_t errlen);
+int  lz4_stream_read(lz4_stream *s, void *dst, size_t n, char *err, size_t errlen);
+int  lz4_stream_measure(lz4_stream *s, uint64_t *out, char *err, size_t errlen);
+void lz4_stream_close(lz4_stream *s);
 
 typedef struct {
     int        fd;

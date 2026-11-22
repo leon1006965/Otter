@@ -522,7 +522,8 @@ as the device identity and uses it for `--confirm` / `--expect-model`.
 | `Changing the partition without unlocking will cause problems.` | `Odin3_v3.14.4.exe` `0x62b942` | `--lock` is opt-in |
 | `There is no PIT partition.!Complete(Write) operation failed.` | exe `0x73b754` | PIT must parse before anything is written |
 | `Re-Partition operation failed.` | exe `0x73b7ce` | `--repartition` is opt-in and the PIT is validated first |
-| `FAIL! LZ4 is invalid` / `FAIL! SHA256 is invalid` | `0x10202be8` / `0x10202ed8` | not reimplemented — see below |
+| `FAIL! LZ4 is invalid` | `0x10202be8` | **implemented**: members are decompressed before sending, using the vendored lz4 reference implementation |
+| `FAIL! SHA256 is invalid` | `0x10202ed8` | not reimplemented — see §15 |
 
 ---
 

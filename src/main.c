@@ -375,7 +375,7 @@ fail:
 /* ------------------------------------------------------------- mapping ---- */
 
 typedef struct {
-    const tar_member *member;
+    tar_member *member;
     size_t            slot;
     const pit_entry  *target;
     uint32_t          chunk;
@@ -401,7 +401,7 @@ static int build_mapping(const pit_file *pit)
         base[s] = total;
         if (!g_slots[s].used) continue;
         for (size_t i = 0; i < g_slots[s].tar.count; i++) {
-            const tar_member *m = &g_slots[s].tar.members[i];
+            tar_member *m = &g_slots[s].tar.members[i];
             if (m->is_pit) continue;      /* Odin splits this off (FUN_1001d750) */
             if (m->size == 0) continue;
             size_t nl = strlen(m->name);
@@ -421,7 +421,7 @@ static int build_mapping(const pit_file *pit)
     for (size_t s = 0; s < ARRAY_LEN(g_slots); s++) {
         if (!g_slots[s].used) continue;
         for (size_t i = 0; i < g_slots[s].tar.count; i++) {
-            const tar_member *m = &g_slots[s].tar.members[i];
+            tar_member *m = &g_slots[s].tar.members[i];
             if (m->is_pit) continue;
             if (m->size == 0) continue;
             size_t nl = strlen(m->name);
@@ -457,6 +457,16 @@ static int build_mapping(const pit_file *pit)
     }
     (void)base;
     return ODIN_OK;
+}
+
+/* Sum of what will actually be transmitted - the uncompressed sizes. */
+static uint64_t map_total(void)
+{
+    uint64_t t = 0;
+    for (size_t i = 0; i < g_map_count; i++)
+        t += g_map[i].member->unc_size ? g_map[i].member->unc_size
+                                       : g_map[i].member->size;
+    return t;
 }
 
 /* ------------------------------------------------------------------ gates */
@@ -626,13 +636,16 @@ static int gate_image_fits(void)
     for (size_t i = 0; i < g_map_count; i++) {
         uint64_t cap = pit_capacity_bytes(g_map[i].target);
         if (cap == 0) continue;
-        if (g_map[i].member->size > cap) {
+        uint64_t payload = g_map[i].member->unc_size
+                            ? g_map[i].member->unc_size
+                            : g_map[i].member->size;
+        if (payload > cap) {
             snprintf(g_err, sizeof(g_err),
                      "\"%s\" is %llu bytes but partition \"%s\" is only %llu bytes "
                      "(%llu blocks of 4096); refusing - pass --allow-oversize "
                      "to override",
                      g_map[i].member->name,
-                     (unsigned long long)g_map[i].member->size,
+                     (unsigned long long)payload,
                      g_map[i].target->name1,
                      (unsigned long long)cap,
                      (unsigned long long)g_map[i].target->dword[6]);
@@ -642,50 +655,65 @@ static int gate_image_fits(void)
     return ODIN_OK;
 }
 
-/* Odin supports LZ4-compressed tar members: FUN_1001c560 branches on
- * member+0x38 and calls FUN_1001bad0, which decompresses through
- * FUN_10001e40 before sending.  This driver does not decompress, so sending
- * such a member would write compressed garbage.  Refuse it - there is no
- * correct behaviour without a decompressor, so no override flag. */
-static int gate_no_compressed_members(void)
+/* Odin decompresses LZ4 members before sending them (FUN_1001bad0 ->
+ * FUN_10001e40), so the bytes on the wire are the *uncompressed* image while
+ * the tar stores the compressed one.  Resolve every member's real size here,
+ * before anything is written:
+ *
+ *   raw member          -> unc_size == size
+ *   LZ4 frame / legacy  -> decode once to learn the size when the frame does
+ *                          not carry a content-size field
+ *   unknown container   -> refused.  A raw LZ4 block has no header at all, so
+ *                          its boundaries are unknowable and guessing them
+ *                          would mean writing garbage to the phone.
+ *
+ * Resolving up front also means the fits-the-partition gate runs against the
+ * uncompressed size, which is the one that actually matters.
+ */
+static int gate_resolve_sizes(void)
 {
     for (size_t i = 0; i < g_map_count; i++) {
-        const mapped_item *it = &g_map[i];
-        const char *nm = it->member->name;
-        size_t nlen = strlen(nm);
+        mapped_item *it = &g_map[i];
+        tar_member *m = it->member;
+        int fd = g_slots[it->slot].tar.fd;
 
-        /* Samsung ships compressed members as *.lz4 inside the tar.  Check the
-         * name first - that is the common case and needs no guessing. */
-        if (nlen >= 4 && strcasecmp(nm + nlen - 4, ".lz4") == 0) {
+        m->compressed = false;
+        m->unc_size   = m->size;
+
+        int looks = lz4_looks_compressed(fd, m->data_offset, m->name);
+        if (looks < 0) {
+            snprintf(g_err, sizeof(g_err), "\"%s\": could not read the payload",
+                     m->name);
+            return ODIN_ERR_IO;
+        }
+        if (looks == 0) continue;                    /* ordinary raw image */
+
+        lz4_stream st;
+        uint64_t known = 0;
+        int rc = lz4_stream_open(&st, fd, m->data_offset, m->size,
+                                 &known, g_err, sizeof(g_err));
+        if (rc != ODIN_OK) return rc;                /* unsupported container */
+
+        if (known == 0) {                            /* size not stored: measure */
+            uint64_t measured = 0;
+            rc = lz4_stream_measure(&st, &measured, g_err, sizeof(g_err));
+            lz4_stream_close(&st);
+            if (rc != ODIN_OK) return rc;
+            known = measured;
+        } else {
+            lz4_stream_close(&st);
+        }
+
+        if (known == 0) {
             snprintf(g_err, sizeof(g_err),
-                     "\"%s\" is an LZ4-compressed member; Odin decompresses "
-                     "these before sending (FUN_1001bad0) but this driver does "
-                     "not, so flashing it would write compressed garbage - "
-                     "refusing", nm);
+                     "\"%s\" is LZ4 but decodes to 0 bytes - refusing", m->name);
             return ODIN_ERR_FORMAT;
         }
 
-        /* Then the payload itself, so a renamed or differently-suffixed
-         * compressed member is caught too.  All three LZ4 container magics. */
-        static const uint8_t lz4magic[][4] = {
-            {0x04, 0x22, 0x4D, 0x18},   /* LZ4 frame      0x184D2204 */
-            {0x02, 0x21, 0x4C, 0x18},   /* LZ4 legacy     0x184C2102 */
-            {0x60, 0x2A, 0x4D, 0x18},   /* LZ4 skippable  0x184D2A60 */
-        };
-        uint8_t mag[4];
-        if (pread(g_slots[it->slot].tar.fd, mag, 4,
-                  (off_t)it->member->data_offset) != 4)
-            continue;
-        for (size_t k = 0; k < sizeof lz4magic / sizeof lz4magic[0]; k++) {
-            if (memcmp(mag, lz4magic[k], 4) == 0) {
-                snprintf(g_err, sizeof(g_err),
-                         "\"%s\" starts with an LZ4 container magic; Odin "
-                         "decompresses these before sending (FUN_1001bad0) but "
-                         "this driver does not, so flashing it would write "
-                         "compressed garbage - refusing", nm);
-                return ODIN_ERR_FORMAT;
-            }
-        }
+        m->compressed = true;
+        m->unc_size = known;
+        printf("  %-38.38s %10llu -> %llu bytes (LZ4 decompressed)\n", m->name,
+               (unsigned long long)m->size, (unsigned long long)known);
     }
     return ODIN_OK;
 }
@@ -758,7 +786,7 @@ static int run_gates(const pit_file *pit)
 {
     int rc = build_mapping(pit);
     if (rc == ODIN_OK) rc = gate_membership_sizes();
-    if (rc == ODIN_OK) rc = gate_no_compressed_members();
+    if (rc == ODIN_OK) rc = gate_resolve_sizes();
     if (rc == ODIN_OK) rc = gate_all_mapped();
     if (rc == ODIN_OK) rc = gate_image_fits();
     if (rc == ODIN_OK) rc = gate_chunk_sizes();
@@ -787,6 +815,10 @@ static void print_plan(const pit_file *pit, const char *identity,
     for (size_t i = 0; i < g_map_count; i++) {
         const mapped_item *it = &g_map[i];
         uint64_t cap = pit_capacity_bytes(it->target);
+        /* What is transmitted, not what sits in the tar: for an LZ4 member
+         * those differ, and the difference is the whole point. */
+        uint64_t payload = it->member->unc_size ? it->member->unc_size
+                                                : it->member->size;
         char caps[32];
         if (cap == 0) snprintf(caps, sizeof(caps), "(remainder)");
         else snprintf(caps, sizeof(caps), "%llu", (unsigned long long)cap);
@@ -794,11 +826,11 @@ static void print_plan(const pit_file *pit, const char *identity,
                g_slots[it->slot].label, it->member->name,
                it->target->dword[1],
                it->target->name1[0] ? it->target->name1 : "-",
-               it->member->size, caps, it->chunk);
+               payload, caps, it->chunk);
         mrec("PLAN", "%s\t%s\t%u\t%s\t%" PRIu64 "\t%s\t%u",
              g_slots[it->slot].label, it->member->name, it->target->dword[1],
              it->target->name1[0] ? it->target->name1 : "-",
-             it->member->size, caps, it->chunk);
+             payload, caps, it->chunk);
     }
     mrec("CONFIRM", "%s", identity ? identity : "");
     printf("confirm token   : %s\n", identity ? identity : "(device only)");
@@ -811,13 +843,28 @@ static void print_plan(const pit_file *pit, const char *identity,
 static int flash_member(odin_ctx *c, const mapped_item *it)
 {
     const tar_member *m = it->member;
+    /* For a compressed member the tar holds the LZ4 stream and the phone gets
+     * the raw image, so everything below is accounted in uncompressed bytes. */
+    uint64_t total = m->unc_size ? m->unc_size : m->size;
     uint64_t sent = 0;
     uint8_t *buf = malloc(c->packet_size);
     if (!buf) return ODIN_ERR_IO;
     int rc = ODIN_OK;
 
-    while (sent < m->size) {
-        uint64_t remaining = m->size - sent;
+    lz4_stream st;
+    lz4_stream *z = NULL;
+    if (m->compressed) {
+        uint64_t known = 0;
+        if (lz4_stream_open(&st, g_slots[it->slot].tar.fd, m->data_offset,
+                            m->size, &known, g_err, sizeof(g_err)) != ODIN_OK) {
+            free(buf);
+            return ODIN_ERR_FORMAT;
+        }
+        z = &st;
+    }
+
+    while (sent < total) {
+        uint64_t remaining = total - sent;
         uint32_t u = (remaining > (uint64_t)it->chunk)
                      ? it->chunk : (uint32_t)remaining;
         if (u == 0) { rc = ODIN_ERR_STATE; break; }
@@ -838,14 +885,26 @@ static int flash_member(odin_ctx *c, const mapped_item *it)
         memset(buf, 0, c->packet_size);
         while (t < u) {
             uint32_t n = (u - t < c->packet_size) ? (u - t) : c->packet_size;
-            off_t at = (off_t)m->data_offset + (off_t)(sent + t);
-            ssize_t got = pread(g_slots[it->slot].tar.fd, buf, n, at);
-            if (got != (ssize_t)n) {
-                snprintf(g_err, sizeof(g_err),
-                         "short read on \"%s\" at offset %llu (%zd of %u bytes)",
-                         m->name, (unsigned long long)(sent + t), got, n);
-                rc = ODIN_ERR_IO;
-                break;
+            if (z) {
+                int got = lz4_stream_read(z, buf, n, g_err, sizeof(g_err));
+                if (got < 0) { rc = ODIN_ERR_FORMAT; break; }
+                if (got != (int)n) {
+                    snprintf(g_err, sizeof(g_err),
+                             "LZ4 member \"%s\" ended early: wanted %u decoded "
+                             "bytes, got %d", m->name, n, got);
+                    rc = ODIN_ERR_FORMAT;
+                    break;
+                }
+            } else {
+                off_t at = (off_t)m->data_offset + (off_t)(sent + t);
+                ssize_t got = pread(g_slots[it->slot].tar.fd, buf, n, at);
+                if (got != (ssize_t)n) {
+                    snprintf(g_err, sizeof(g_err),
+                             "short read on \"%s\" at offset %llu (%zd of %u bytes)",
+                             m->name, (unsigned long long)(sent + t), got, n);
+                    rc = ODIN_ERR_IO;
+                    break;
+                }
             }
             rc = odin_data_block(c, buf, c->packet_size);
             if (rc != ODIN_OK) break;
@@ -855,7 +914,7 @@ static int flash_member(odin_ctx *c, const mapped_item *it)
         if (rc != ODIN_OK) break;
 
         sent += u;
-        uint32_t last = (sent == m->size) ? 1u : 0u;
+        uint32_t last = (sent == total) ? 1u : 0u;
         /* FUN_1001c560 @ 0x1001c826..0x1001c866 */
         uint32_t trailer[8] = {
             0u, u,
@@ -868,10 +927,11 @@ static int flash_member(odin_ctx *c, const mapped_item *it)
         if (rc != ODIN_OK) break;
 
         printf("  %-16.16s %10llu / %llu bytes\n",
-               it->target->name1[0] ? it->target->name1 : it->member->name,
-               (unsigned long long)sent, (unsigned long long)m->size);
+               it->target->name1[0] ? it->target->name1 : m->name,
+               (unsigned long long)sent, (unsigned long long)total);
     }
 
+    if (z) lz4_stream_close(z);
     free(buf);
     return rc;
 }
@@ -1053,6 +1113,10 @@ int main(int argc, char **argv)
         if (rc != ODIN_OK) { fprintf(stderr, "error: %s\n", g_err); pit_free(&op); return 1; }
         rc = run_gates(&op);
         if (rc != ODIN_OK) { fprintf(stderr, "error: %s\n", g_err); pit_free(&op); return 1; }
+        if (map_total() != total)
+            printf("payload: %llu bytes stored, %llu after LZ4 decompression\n",
+                   (unsigned long long)total, (unsigned long long)map_total());
+        total = map_total();
         print_plan(&op, NULL, total, true);
         printf("\noffline plan complete - no device was contacted.\n");
         pit_free(&op);
@@ -1216,6 +1280,10 @@ int main(int argc, char **argv)
         t.destroy(&t);
         return 1;
     }
+    if (map_total() != total)
+        printf("payload: %llu bytes stored, %llu after LZ4 decompression\n",
+               (unsigned long long)total, (unsigned long long)map_total());
+    total = map_total();
     print_plan(&pit, di.model, total, false);
 
     if (strcmp(cmd, "flash") != 0) {
