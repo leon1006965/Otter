@@ -161,13 +161,30 @@ int tar_open(const char *path, tar_archive *out, char *err, size_t errlen)
         m.data_offset = (uint32_t)(off + TAR_BLOCK);
         m.is_pit = (strcmp(m.name, "PIT") == 0);
 
+        uint64_t step = TAR_BLOCK + ((sz + TAR_BLOCK - 1) / TAR_BLOCK) * TAR_BLOCK;
+        if (step < TAR_BLOCK) break;
+
+        /* Only regular files are flashable.  A tar written in pax format
+         * carries an extra entry per file whose typeflag is 'x' (and 'g' for a
+         * global header); those hold attribute text - in the file that
+         * prompted this, 19 bytes reading "19 size=9126805504\n" - not image
+         * data.  Directories are '5', GNU long names are 'L'/'K'.  None of
+         * them belong in a flash plan, and treating the pax header as a file
+         * is what produced the unmappable "AP_x/PaxHeader/super.img". */
+        char type = hdr[156];
+        if (type != '0' && type != '\0' && type != '7') {
+            if (type == 'x' || type == 'g' || type == 'L' || type == 'K')
+                printf("  (skipping %s: tar type '%c' holds metadata, "
+                       "not image data)\n", m.name, type);
+            off += step;
+            continue;
+        }
+
         if (strncmp(m.name, "meta-data/", 10) != 0 &&
             strncmp(m.name, "meta-data\\", 10) != 0) {
             push_member(out, &m);
         }
 
-        uint64_t step = TAR_BLOCK + ((sz + TAR_BLOCK - 1) / TAR_BLOCK) * TAR_BLOCK;
-        if (step == 0) break;
         off += step;
     }
 

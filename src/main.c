@@ -393,6 +393,21 @@ static size_t       g_map_count;
  *
  * Zero-length members and directory entries are excluded: Odin's transfer
  * loop never runs for them, so no command is skipped that Odin would send. */
+/* Odin's rule is __wcsicmp on the whole member name.  Custom ROM tars often
+ * carry a directory prefix ("AP_EliteUI8.5/super.img") that the PIT does not
+ * have ("super.img"), so pass 2 compares only the last path component.  It is
+ * a deliberate extension beyond Odin, and it stays safe because the
+ * duplicate-partition gate still refuses two members landing on one partition
+ * and the unmapped-member gate still refuses everything else. */
+static bool member_matches(const char *member_name, const char *pit_name2,
+                           int allow_prefix)
+{
+    if (str_ieq(member_name, pit_name2)) return true;
+    if (!allow_prefix) return false;
+    const char *base = strrchr(member_name, '/');
+    return base != NULL && base[1] != '\0' && str_ieq(base + 1, pit_name2);
+}
+
 static int build_mapping(const pit_file *pit)
 {
     size_t base[ARRAY_LEN(g_slots)];
@@ -434,25 +449,27 @@ static int build_mapping(const pit_file *pit)
     }
     g_map_count = k;
 
-    for (uint32_t e = 0; e < pit->count; e++) {
-        const pit_entry *pe = &pit->entries[e];
-        if (pe->name2[0] == '\0') continue;
-        bool done = false;
-        for (size_t s = 0; s < ARRAY_LEN(g_slots) && !done; s++) {
-            if (!g_slots[s].used) continue;
-            for (size_t i = 0; i < g_slots[s].tar.count && !done; i++) {
-                /* g_map was built in exactly this order, so member (s,i) has
-                 * the next index after the previous qualifying member of s. */
-                for (size_t idx = 0; idx < g_map_count; idx++) {
-                    if (g_map[idx].slot != s) continue;
-                    if (g_map[idx].member != &g_slots[s].tar.members[i]) continue;
-                    if (g_map[idx].target != NULL) continue;
-                    if (!str_ieq(g_map[idx].member->name, pe->name2)) continue;
-                    g_map[idx].target = pe;
-                    done = true;
-                    break;
+    for (int pass = 0; pass < 2; pass++) {
+        int allow_prefix = (pass == 1);
+        for (uint32_t e = 0; e < pit->count; e++) {
+            const pit_entry *pe = &pit->entries[e];
+            if (pe->name2[0] == '\0') continue;
+            for (size_t s = 0; s < ARRAY_LEN(g_slots); s++) {
+                if (!g_slots[s].used) continue;
+                for (size_t i = 0; i < g_slots[s].tar.count; i++) {
+                    for (size_t idx = 0; idx < g_map_count; idx++) {
+                        if (g_map[idx].slot != s) continue;
+                        if (g_map[idx].member != &g_slots[s].tar.members[i]) continue;
+                        if (g_map[idx].target != NULL) continue;
+                        if (!member_matches(g_map[idx].member->name,
+                                             pe->name2, allow_prefix))
+                            continue;
+                        g_map[idx].target = pe;
+                        goto matched;      /* Odin returns after the first hit */
+                    }
                 }
             }
+        matched:;
         }
     }
     (void)base;

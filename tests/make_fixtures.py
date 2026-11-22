@@ -71,6 +71,31 @@ def build_tar(path, members):
         f.write(b'\0' * 1024)
     print("wrote", path)
 
+def build_tar_ex(path, entries):
+    """Like build_tar but with explicit typeflags: entries are
+    (name, typeflag, payload).  Needed to reproduce pax/directory tars."""
+    with open(path, 'wb') as f:
+        for name, tflag, payload in entries:
+            h = bytearray(512)
+            nb = name.encode()
+            h[0:len(nb)] = nb
+            h[100:108] = b'0000644\0'
+            h[108:116] = b'0000000\0'
+            h[116:124] = b'0000000\0'
+            h[124:136] = ('%011o\0' % len(payload)).encode()
+            h[136:148] = b'00000000000\0'
+            h[156] = ord(tflag)
+            h[257:263] = b'ustar\0'
+            h[263:265] = b'00'
+            h[148:156] = b'        '
+            h[148:156] = ('%06o\0 ' % sum(h)).encode()
+            f.write(bytes(h))
+            f.write(payload)
+            f.write(b'\0' * ((512 - len(payload) % 512) % 512))
+        f.write(b'\0' * 1024)
+    print("wrote", path)
+
+
 if __name__ == '__main__':
     build_pit(os.path.join(OUT, 'test.pit'))
     build_tar(os.path.join(OUT, 'test.tar'), [
@@ -99,6 +124,15 @@ if __name__ == '__main__':
     # a partition only the user's extension file can protect
     build_tar(os.path.join(OUT, 'foo.tar'), [
         ('vndboot.img', b'F' * 100),
+    ])
+    # a pax-format tar: a directory, an extended-header entry ('x') that holds
+    # only "size=...", and members with a directory prefix.  Reproduces the
+    # real AP_EliteUI8.tar that failed with "matched no PIT entry".
+    build_tar_ex(os.path.join(OUT, 'pax.tar'), [
+        ('AP_X/',                      '5', b''),
+        ('AP_X/PaxHeader/boot.img',    'x', b'12 size=300\n'),
+        ('AP_X/boot.img',              '0', b'B' * 300),
+        ('AP_X/system.img',            '0', b'S' * 300),
     ])
     # starts with the LZ4 frame magic: Odin would decompress it, we must refuse
     build_tar(os.path.join(OUT, 'lz4.tar'), [
