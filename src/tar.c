@@ -82,6 +82,23 @@ static void push_member(tar_archive *t, const tar_member *m)
     t->members[t->count++] = *m;
 }
 
+/* Record an entry we met but will not flash.  Kept on the archive rather than
+ * only printed so the plan (and the GUI confirm dialog) can list it: a member
+ * silently disappearing is exactly the surprise this reader must not cause. */
+static void note_tar_skip(tar_archive *t, const char *name, const char *why)
+{
+    if (t->skip_count == t->skip_cap) {
+        size_t ncap = t->skip_cap ? t->skip_cap * 2 : 8;
+        tar_skip *ns = realloc(t->skips, ncap * sizeof(*ns));
+        if (!ns) return;
+        t->skips = ns;
+        t->skip_cap = ncap;
+    }
+    tar_skip *s = &t->skips[t->skip_count++];
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    snprintf(s->why, sizeof(s->why), "%s", why);
+}
+
 int tar_open(const char *path, tar_archive *out, char *err, size_t errlen)
 {
     memset(out, 0, sizeof(*out));
@@ -173,15 +190,27 @@ int tar_open(const char *path, tar_archive *out, char *err, size_t errlen)
          * is what produced the unmappable "AP_x/PaxHeader/super.img". */
         char type = hdr[156];
         if (type != '0' && type != '\0' && type != '7') {
-            if (type == 'x' || type == 'g' || type == 'L' || type == 'K')
-                printf("  (skipping %s: tar type '%c' holds metadata, "
-                       "not image data)\n", m.name, type);
+            /* Reported rather than silent: a member the reader met and chose
+             * not to flash is never allowed to just vanish from the plan. */
+            const char *why;
+            if (type == 'x' || type == 'g')
+                why = "pax header entry: attributes, not image data";
+            else if (type == 'L' || type == 'K')
+                why = "GNU long-name entry: a name, not image data";
+            else if (type == '5' || type == '4' || type == '2' || type == '3'
+                     || type == '1' || type == '6')
+                why = "a directory/symlink/hardlink, not a regular file";
+            else
+                why = "not a regular file";
+            note_tar_skip(out, m.name, why);
             off += step;
             continue;
         }
 
-        if (strncmp(m.name, "meta-data/", 10) != 0 &&
-            strncmp(m.name, "meta-data\\", 10) != 0) {
+        if (strncmp(m.name, "meta-data/", 10) == 0 ||
+            strncmp(m.name, "meta-data\\", 10) == 0) {
+            note_tar_skip(out, m.name, "meta-data entry, not a partition image");
+        } else {
             push_member(out, &m);
         }
 
@@ -208,4 +237,7 @@ void tar_close(tar_archive *t)
     free(t->members);
     t->members = NULL;
     t->count = t->cap = 0;
+    free(t->skips);
+    t->skips = NULL;
+    t->skip_count = t->skip_cap = 0;
 }

@@ -160,7 +160,7 @@ the following hold.
 | the `ODIN` → `LOKE` handshake must succeed | no `LOKE` means no session and not one further byte |
 | the device info blob must parse and its length must be a multiple of 500 | Odin refuses this too (`FUN_10020810`) |
 | the device PIT must download and parse | count, bounds and every name field are validated |
-| **every** tar member must match a PIT entry | Odin's `Unassigned file` is fatal; so is this |
+| **every** tar member must match a PIT entry *or be skipped* | Odin's `Unassigned file` is fatal for the whole run; we treat it more gently — see *Skipped members* below. Refused outright only when **nothing** is left to flash |
 | every matched entry must have a usable chunk size | type ∉ {0,1,2,6,7,8} makes Odin hang; type 0 with `raw+20 < 128` makes Odin divide by zero. Both are refused before any write |
 | no two members may target the same partition | unless `--allow-duplicate-targets` |
 | every input must be a real `ustar` archive with sizes that fit the file | Odin does not check the magic; refusing a bad archive is the safe direction |
@@ -169,6 +169,24 @@ the following hold.
 | file name vs device model | when **both** the input filename and the device identity carry a Samsung model token they must agree (`AP_G991B…` vs `SM-G991B`). **Warns by default** — it is a heuristic read off a file name, and a false positive must never block a model we have never seen. `--strict-model` makes it a refusal, `--expect-model` pins the device, `--allow-model-mismatch` silences it. If neither side carries a token (most custom recoveries) nothing is checked |
 | boot-critical partitions | boot-chain partitions are denied by default. The shipped names come from one phone's PIT, so **other models add their own** in `~/.config/odin3-critical` (one name per line, `#` starts a comment) instead of us guessing names we have never seen |
 | LZ4 members are decompressed, not refused | the codec is the reference implementation vendored from `github.com/lz4/lz4` **v1.11.1** (BSD-2-Clause, `third_party/lz4/`); framing is implemented here for both the frame (`04 22 4d 18`) and legacy (`02 21 4c 18`) containers. A container with **no recognisable header** — a raw LZ4 block — is refused, because its member boundaries cannot be found without guessing |
+
+### Skipped members
+
+Unusual contents are **reported and skipped, not fatal** — skipping can only
+leave a partition untouched, which is recoverable, whereas a wrong write is
+not. Everything skipped is printed in the plan as `NOT flashed (N)`, mirrored
+as an `OTTER SKIP` record for the GUI, and listed in the confirm dialog so
+nothing disappears silently:
+
+* a member whose name matches no PIT entry (Odin's `Unassigned file`)
+* a member whose data runs past the end of the archive (truncated)
+* a member that is not a regular file — pax headers (`x`, `g`), directories,
+  GNU long-name entries (`L`, `K`) — which hold metadata, not image data
+* a `meta-data/` entry (Odin skips these too, `FUN_1001d750`)
+* an LZ4 member that will not decode
+
+The run is refused only when **nothing** survives, because then there is no
+plan at all.
 
 Three destructive operations are **off by default** and each needs its own flag
 on top of `--flash`:

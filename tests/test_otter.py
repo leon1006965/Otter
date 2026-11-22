@@ -24,10 +24,10 @@ OTTER = os.path.join(ROOT, "otter")
 # self-contained: /tmp gets cleared between sessions, so never depend on it
 GOOD_TAR = os.path.join(HERE, "test.tar")
 PIT = os.path.join(HERE, "test.pit")
-BAD_TAR = os.path.join(HERE, "bad.tar")          # has an unmappable member
+BAD_TAR = os.path.join(HERE, "none.tar")         # no member maps at all
+PARTIAL_TAR = os.path.join(HERE, "partial.tar")  # one maps, one does not
 
 failures, skipped = [], []
-dialogs = []
 
 
 def check(name, cond, detail=""):
@@ -89,10 +89,30 @@ def main():
 
     # Every confirmation dialog is recorded instead of shown, so the modal
     # flow can be asserted without a human (and without blocking).
+    # `dialogs` holds titles (existing checks match on those); `bodies`
+    # holds the visible text so a test can assert on what the user reads.
     orig_run = Gtk.MessageDialog.run
+    dialogs = []
+    bodies = []
+
+    def _dialog_text(dlg):
+        out = []
+
+        def walk(w):
+            if isinstance(w, Gtk.Label):
+                out.append(w.get_label() or "")
+            elif isinstance(w, Gtk.TextView):
+                s, e = w.get_buffer().get_bounds()
+                out.append(w.get_buffer().get_text(s, e, True))
+            for c in (w.get_children() if hasattr(w, "get_children") else []):
+                walk(c)
+
+        walk(dlg.get_message_area())
+        return "\n".join(out)
 
     def fake_run(self):
         dialogs.append(self.get_title() or "")
+        bodies.append(_dialog_text(self))
         self.destroy()
         return Gtk.ResponseType.CANCEL
     Gtk.MessageDialog.run = fake_run
@@ -220,13 +240,23 @@ def main():
     check("plan record captured for the confirm dialog", len(win.plan_rows) == 1
           and win.plan_rows[0][3] == "RECOVERY", str(win.plan_rows))
 
+    # A skipped member is reported, not fatal: the record must be kept and
+    # shown in the confirm dialog, so "it was ignored" is never a surprise.
+    win.skip_rows = []
+    win._line("OTTER\tSKIP\tAP_X/PaxHeader/super.img\ttar type 'x' holds "
+              "metadata, not image data")
+    check("skip record captured", win.skip_rows ==
+          [("AP_X/PaxHeader/super.img",
+            "tar type 'x' holds metadata, not image data")], str(win.skip_rows))
+    check("a later plan record does not clear the skips", len(win.skip_rows) == 1)
+
     # ---- 7. Start runs the gates BEFORE any dialog ------------------------
     if not os.path.isfile(PIT):
         skip("Start gate ordering", "device PIT fixture missing")
     else:
         # (a) a tar with an unmappable member: the CLI refuses, so the
         #     confirmation dialog must never appear.
-        dialogs[:] = []
+        dialogs[:] = []; bodies[:] = []
         win.pit_path = PIT
         win.filers["AP"].set(BAD_TAR)
         win.identity = "SM-G991B"
@@ -239,7 +269,7 @@ def main():
         check("flash never started", win.kind == "preflight", win.kind)
 
         # (b) a plan that passes every gate: the dialog must appear.
-        dialogs[:] = []
+        dialogs[:] = []; bodies[:] = []
         win.filers["AP"].set(GOOD_TAR)
         win._update_actions()
         win._on_start()
@@ -249,9 +279,28 @@ def main():
         check("CANCEL stops before any phone contact", win.kind == "preflight",
               win.kind)
 
+        # (c) one member maps, one does not: the plan passes, and the confirm
+        #     dialog must say up front what will be left out.
+        dialogs[:] = []; bodies[:] = []
+        win.filers["AP"].set(PARTIAL_TAR)
+        win._update_actions()
+        win._on_start()
+        pump_until(win, lambda: (not win.running and win.kind == "preflight"))
+        check("partial plan reaches the confirm dialog", len(dialogs) == 1,
+              str(dialogs))
+        check("confirm dialog lists what is NOT flashed",
+              win.skip_rows and "NOT flashed (1)" in bodies[-1]
+              and "unknown.img" in bodies[-1],
+              bodies[-1][-400:] if bodies else "(no dialog)")
+        check("skipped member is not in the flash plan",
+              all(r[1] != "unknown.img" for r in win.plan_rows),
+              str(win.plan_rows))
+        dialogs[:] = []; bodies[:] = []
+        win.filers["AP"].set(GOOD_TAR)
+
         # A full firmware is tens of rows; the dialog must build its scrollable
         # list without raising (the <=6-row branch is a plain label instead).
-        dialogs[:] = []
+        dialogs[:] = []; bodies[:] = []
         names = [("boot.img", "BOOT"), ("dtbo.img", "DTBO"),
                  ("vbmeta.img", "VBMETA"), ("super.img", "SUPER"),
                  ("recovery.img", "RECOVERY"), ("modem.bin", "RADIO"),
@@ -268,17 +317,17 @@ def main():
             print("      dialog build raised: %r" % e)
         check("12-row plan builds the scrollable confirm dialog",
               built and len(dialogs) == 1, str(dialogs))
-        dialogs[:] = []
+        dialogs[:] = []; bodies[:] = []
 
     # ---- 7b. the popups that explain the one-session rule ----------------
-    dialogs[:] = []
+    dialogs[:] = []; bodies[:] = []
     win.kind = "probe"
     win.rec = {"IDENTITY": "SM-G991B", "PITCOUNT": "48"}
     win._done(0)
     check("successful Probe pops the re-enter-Download-mode note",
           len(dialogs) == 1 and "Probe complete" in dialogs[0], str(dialogs))
 
-    dialogs[:] = []
+    dialogs[:] = []; bodies[:] = []
     win.kind = "flash"
     win.rec = {}
     win._loke_fail = True
@@ -286,14 +335,14 @@ def main():
     check("handshake failure pops a recovery hint",
           len(dialogs) == 1 and "session" in dialogs[0], str(dialogs))
 
-    dialogs[:] = []
+    dialogs[:] = []; bodies[:] = []
     win.kind = "flash"
     win.rec = {"IDENTITY": "SM-G991B"}
     win._loke_fail = False
     win._done(0)
     check("successful flash gets a closing popup",
           len(dialogs) == 1 and "Flash complete" in dialogs[0], str(dialogs))
-    dialogs[:] = []
+    dialogs[:] = []; bodies[:] = []
 
     # ---- 7c. production behaviour: heuristics warn, they do not block -----
     # The phone-independent checks live in the CLI, so exercise them directly.

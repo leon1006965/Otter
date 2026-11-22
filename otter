@@ -115,6 +115,7 @@ class Otter(Gtk.Window):
         self.running = False
         self.rec = {}
         self.plan_rows = []
+        self.skip_rows = []          # (name, reason) - reported, not flashed
         self.identity = ""
         self.serial_path = ""
         self.devlist = []
@@ -415,11 +416,13 @@ class Otter(Gtk.Window):
 
     def _slot_changed(self):
         self.plan_rows = []          # any change invalidates a previewed plan
+        self.skip_rows = []
         self._update_actions()
 
     def _opt_changed(self):
         self.pit_row.set_visible(self.flags["repartition"].get_active())
         self.plan_rows = []
+        self.skip_rows = []
 
     # --------------------------------------------------------------- logging
 
@@ -460,6 +463,7 @@ class Otter(Gtk.Window):
         if kind == "list":
             self.devlist = []
         self.plan_rows = []          # always recompute, never reuse
+        self.skip_rows = []
         self.running = True
         self._have_progress = False
         self._update_actions()
@@ -489,6 +493,8 @@ class Otter(Gtk.Window):
             key = parts[1]
             if key == "PLAN":
                 self.plan_rows.append(parts[2:])
+            elif key == "SKIP" and len(parts) >= 4:
+                self.skip_rows.append((parts[2], "\t".join(parts[3:])))
             elif key == "PROGRESS" and len(parts) >= 4:
                 try:
                     done, total = int(parts[2]), int(parts[3])
@@ -689,6 +695,14 @@ class Otter(Gtk.Window):
             body = "\n".join(os.path.basename(p) for p in _paths(self))
             summary = "no saved device PIT, so no partition preview"
 
+        # Members the pre-flight dropped (unknown folder, odd typeflag, no
+        # matching partition) - listed so "it was ignored" is never a
+        # surprise the user discovers afterwards.
+        if self.skip_rows:
+            body += "\n\nNOT flashed (%d):\n" % len(self.skip_rows) + "\n".join(
+                "  %-42s %s" % (n[:42], why) for n, why in self.skip_rows)
+            summary += ", %d skipped" % len(self.skip_rows)
+
         dlg = Gtk.MessageDialog(transient_for=self, modal=True,
                                 message_type=Gtk.MessageType.WARNING,
                                 buttons=Gtk.ButtonsType.OK_CANCEL)
@@ -697,11 +711,15 @@ class Otter(Gtk.Window):
                        "The phone must be in Download mode."
                        % (esc(self.identity), esc(summary)))
 
-        if len(rows) > 6:
+        # The dialog cannot scroll, so anything longer than a few lines goes
+        # into a capped scroll view - counted over the whole body, skips
+        # included, or a long "NOT flashed" list would still run off screen.
+        nlines = body.count("\n") + 1
+        if nlines > 6:
             sw = Gtk.ScrolledWindow()
             sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             sw.set_propagate_natural_height(True)
-            sw.set_min_content_height(22 * min(len(rows), 6))
+            sw.set_min_content_height(22 * min(nlines, 6))
             sw.set_max_content_height(320)
             tv = Gtk.TextView()
             tv.set_editable(False)

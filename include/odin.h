@@ -234,12 +234,22 @@ int  lz4_stream_read(lz4_stream *s, void *dst, size_t n, char *err, size_t errle
 int  lz4_stream_measure(lz4_stream *s, uint64_t *out, char *err, size_t errlen);
 void lz4_stream_close(lz4_stream *s);
 
+/* A member the reader met but decided not to make flashable.  Recorded (not
+ * just printed) so the plan and the GUI can say what was left out. */
+typedef struct {
+    char name[256];
+    char why[160];
+} tar_skip;
+
 typedef struct {
     int        fd;
     uint64_t   file_size;
     tar_member *members;
     size_t      count;
     size_t      cap;
+    tar_skip   *skips;         /* unusual entries, reported not fatal       */
+    size_t      skip_count;
+    size_t      skip_cap;
 } tar_archive;
 
 int  tar_open(const char *path, tar_archive *out, char *err, size_t errlen);

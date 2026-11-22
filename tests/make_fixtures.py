@@ -103,9 +103,14 @@ if __name__ == '__main__':
         ('system.img',   b'S' * 700000),
         ('meta-data/x',  b'm' * 100),
     ])
-    # a tar with an unmapped member: the gate must refuse it
-    build_tar(os.path.join(OUT, 'bad.tar'), [
+    # one member maps, one does not: the odd one is skipped and reported,
+    # the rest still flashes
+    build_tar(os.path.join(OUT, 'partial.tar'), [
         ('boot.img',     b'B' * 100),
+        ('unknown.img',  b'U' * 100),
+    ])
+    # nothing maps at all: still a hard refusal
+    build_tar(os.path.join(OUT, 'none.tar'), [
         ('unknown.img',  b'U' * 100),
     ])
     # a tar mapping onto the type-0 / dword5<128 entry: Odin would divide by

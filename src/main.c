@@ -486,18 +486,59 @@ static uint64_t map_total(void)
     return t;
 }
 
+/* Members we decided not to flash.  Odd-but-harmless tar contents (unknown
+ * folders, metadata entries, a member that does not correspond to any
+ * partition) are reported and dropped rather than aborting the whole run -
+ * skipping can only leave a partition untouched, which is recoverable, while
+ * a wrong write is not.  Everything is still listed, so nothing is silent. */
+#define SKIP_MAX 64
+static char   g_skipped[SKIP_MAX][360];
+static size_t g_skipped_n;
+
+static void note_skip(const char *name, const char *why)
+{
+    if (g_skipped_n >= SKIP_MAX) return;
+    snprintf(g_skipped[g_skipped_n], sizeof g_skipped[0],
+             "%.200s\t%.140s", name, why);
+    g_skipped_n++;
+    printf("  (skipping %s: %s)\n", name, why);
+}
+
+/* Remove entry i from the plan, recording why.  Callers iterate backwards so
+ * the shift never invalidates an index they still have to visit. */
+static void drop_member(size_t i, const char *why)
+{
+    note_skip(g_map[i].member->name, why);
+    for (size_t j = i; j + 1 < g_map_count; j++)
+        g_map[j] = g_map[j + 1];
+    g_map_count--;
+}
+
 /* ------------------------------------------------------------------ gates */
 
-static int gate_all_mapped(void)
+/* Anything that cannot be written is dropped and reported instead of
+ * aborting: an unmapped member, or one whose data runs past the end of the
+ * archive.  Refuse only when nothing is left. */
+static int filter_members(void)
 {
-    for (size_t i = 0; i < g_map_count; i++) {
+    for (size_t i = g_map_count; i-- > 0; ) {
+        tar_member *m = g_map[i].member;
         if (!g_map[i].target) {
-            snprintf(g_err, sizeof(g_err),
-                     "\"%s\" (%s) matched no PIT entry - Odin reports this as "
-                     "the fatal \"Unassigned file\" error and so do we",
-                     g_map[i].member->name, g_slots[g_map[i].slot].label);
-            return ODIN_ERR_SAFETY;
+            drop_member(i, "no partition in the device PIT has this file name");
+            continue;
         }
+        if ((uint64_t)m->data_offset + m->size >
+            g_slots[g_map[i].slot].tar.file_size) {
+            drop_member(i, "its data runs past the end of the archive "
+                           "(truncated file?)");
+            continue;
+        }
+    }
+    if (g_map_count == 0) {
+        snprintf(g_err, sizeof(g_err),
+                 "none of the members map to a partition in the device PIT, "
+                 "so there is nothing to flash");
+        return ODIN_ERR_STATE;
     }
     return ODIN_OK;
 }
@@ -546,20 +587,6 @@ static int gate_unique_partitions(void)
     return ODIN_OK;
 }
 
-static int gate_membership_sizes(void)
-{
-    for (size_t i = 0; i < g_map_count; i++) {
-        const tar_member *m = g_map[i].member;
-        uint64_t end = (uint64_t)m->data_offset + m->size;
-        if (end > g_slots[g_map[i].slot].tar.file_size) {
-            snprintf(g_err, sizeof(g_err),
-                     "\"%s\" claims %llu bytes but the archive ends earlier",
-                     m->name, (unsigned long long)m->size);
-            return ODIN_ERR_FORMAT;
-        }
-    }
-    return ODIN_OK;
-}
 
 /* Partitions whose contents are part of the boot chain or hold key material.
  * Writing one of these with a bad image is the realistic hard-brick path, so
@@ -689,7 +716,7 @@ static int gate_image_fits(void)
  */
 static int gate_resolve_sizes(void)
 {
-    for (size_t i = 0; i < g_map_count; i++) {
+    for (size_t i = g_map_count; i-- > 0; ) {
         mapped_item *it = &g_map[i];
         tar_member *m = it->member;
         int fd = g_slots[it->slot].tar.fd;
@@ -698,39 +725,38 @@ static int gate_resolve_sizes(void)
         m->unc_size   = m->size;
 
         int looks = lz4_looks_compressed(fd, m->data_offset, m->name);
-        if (looks < 0) {
-            snprintf(g_err, sizeof(g_err), "\"%s\": could not read the payload",
-                     m->name);
-            return ODIN_ERR_IO;
-        }
+        if (looks < 0) { drop_member(i, "its payload could not be read"); continue; }
         if (looks == 0) continue;                    /* ordinary raw image */
 
         lz4_stream st;
         uint64_t known = 0;
         int rc = lz4_stream_open(&st, fd, m->data_offset, m->size,
                                  &known, g_err, sizeof(g_err));
-        if (rc != ODIN_OK) return rc;                /* unsupported container */
+        if (rc != ODIN_OK) { drop_member(i, g_err); continue; }
 
         if (known == 0) {                            /* size not stored: measure */
             uint64_t measured = 0;
             rc = lz4_stream_measure(&st, &measured, g_err, sizeof(g_err));
             lz4_stream_close(&st);
-            if (rc != ODIN_OK) return rc;
+            if (rc != ODIN_OK) { drop_member(i, g_err); continue; }
             known = measured;
         } else {
             lz4_stream_close(&st);
         }
 
         if (known == 0) {
-            snprintf(g_err, sizeof(g_err),
-                     "\"%s\" is LZ4 but decodes to 0 bytes - refusing", m->name);
-            return ODIN_ERR_FORMAT;
+            drop_member(i, "is LZ4 but decodes to 0 bytes");
+            continue;
         }
 
         m->compressed = true;
         m->unc_size = known;
         printf("  %-38.38s %10llu -> %llu bytes (LZ4 decompressed)\n", m->name,
                (unsigned long long)m->size, (unsigned long long)known);
+    }
+    if (g_map_count == 0) {
+        snprintf(g_err, sizeof(g_err), "no member survived pre-flight");
+        return ODIN_ERR_STATE;
     }
     return ODIN_OK;
 }
@@ -802,14 +828,49 @@ static int gate_model_match(const char *device_id)
 static int run_gates(const pit_file *pit)
 {
     int rc = build_mapping(pit);
-    if (rc == ODIN_OK) rc = gate_membership_sizes();
+    if (rc == ODIN_OK) rc = filter_members();
     if (rc == ODIN_OK) rc = gate_resolve_sizes();
-    if (rc == ODIN_OK) rc = gate_all_mapped();
     if (rc == ODIN_OK) rc = gate_image_fits();
     if (rc == ODIN_OK) rc = gate_chunk_sizes();
     if (rc == ODIN_OK) rc = gate_unique_partitions();
     if (rc == ODIN_OK) rc = gate_critical_partitions();
     return rc;
+}
+
+/* The plan only covers what survives pre-flight, so the progress total has to
+ * be recomputed from it - and whenever it differs from what is on disk, say
+ * why rather than leaving the two numbers to disagree silently. */
+static uint64_t sync_total(uint64_t on_disk)
+{
+    uint64_t sent = map_total();
+    if (sent != on_disk) {
+        bool lz4 = false;
+        for (size_t i = 0; i < g_map_count; i++)
+            if (g_map[i].member->compressed) { lz4 = true; break; }
+        printf("payload: %llu bytes in the archive -> %llu to send%s%s\n",
+               (unsigned long long)on_disk, (unsigned long long)sent,
+               lz4 ? " (LZ4 members decompressed)" : "",
+               g_skipped_n ? " (skipped members excluded)" : "");
+    }
+    return sent;
+}
+
+/* List everything that was dropped, so a skipped member is never silent. */
+static void report_skips(void)
+{
+    if (g_skipped_n == 0) return;
+    printf("\n  NOT flashed (%zu):\n", g_skipped_n);
+    for (size_t i = 0; i < g_skipped_n; i++) {
+        mrec("SKIP", "%s", g_skipped[i]);          /* "name\treason" */
+        char *tab = strchr(g_skipped[i], '\t');
+        if (tab) {
+            *tab = '\0';
+            printf("    %-44s %s\n", g_skipped[i], tab + 1);
+            *tab = '\t';                          /* restore */
+        } else {
+            printf("    %s\n", g_skipped[i]);
+        }
+    }
 }
 
 static void print_plan(const pit_file *pit, const char *identity,
@@ -849,6 +910,7 @@ static void print_plan(const pit_file *pit, const char *identity,
              it->target->name1[0] ? it->target->name1 : "-",
              payload, caps, it->chunk);
     }
+    report_skips();
     mrec("CONFIRM", "%s", identity ? identity : "");
     printf("confirm token   : %s\n", identity ? identity : "(device only)");
     printf("------------------------------------------------------------\n");
@@ -1095,6 +1157,12 @@ int main(int argc, char **argv)
             if (rc != ODIN_OK) { fprintf(stderr, "error: %s\n", g_err); return 1; }
             printf("  %-4s %-58s %zu members\n",
                    g_slots[s].label, g_slots[s].path, g_slots[s].tar.count);
+            /* Entries the reader met but will not flash (pax metadata,
+             * directories, meta-data/) - promoted into the shared skip list
+             * so they show up in the plan, the report and the GUI alike. */
+            for (size_t i = 0; i < g_slots[s].tar.skip_count; i++)
+                note_skip(g_slots[s].tar.skips[i].name,
+                          g_slots[s].tar.skips[i].why);
             for (size_t i = 0; i < g_slots[s].tar.count; i++) {
                 const tar_member *m = &g_slots[s].tar.members[i];
                 if (m->is_pit) continue;   /* Odin does not count it either */
@@ -1130,10 +1198,7 @@ int main(int argc, char **argv)
         if (rc != ODIN_OK) { fprintf(stderr, "error: %s\n", g_err); pit_free(&op); return 1; }
         rc = run_gates(&op);
         if (rc != ODIN_OK) { fprintf(stderr, "error: %s\n", g_err); pit_free(&op); return 1; }
-        if (map_total() != total)
-            printf("payload: %llu bytes stored, %llu after LZ4 decompression\n",
-                   (unsigned long long)total, (unsigned long long)map_total());
-        total = map_total();
+        total = sync_total(total);
         print_plan(&op, NULL, total, true);
         printf("\noffline plan complete - no device was contacted.\n");
         pit_free(&op);
@@ -1297,10 +1362,7 @@ int main(int argc, char **argv)
         t.destroy(&t);
         return 1;
     }
-    if (map_total() != total)
-        printf("payload: %llu bytes stored, %llu after LZ4 decompression\n",
-               (unsigned long long)total, (unsigned long long)map_total());
-    total = map_total();
+    total = sync_total(total);
     print_plan(&pit, di.model, total, false);
 
     if (strcmp(cmd, "flash") != 0) {
