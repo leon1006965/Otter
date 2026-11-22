@@ -12,15 +12,44 @@ an open question in §15 of that document rather than filled in.
 
 ---
 
-## Install (one command)
+## Install
+
+Paste this into a terminal:
 
 ```sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/leon1006965/Otter/main/setup.sh | sh
 ```
 
-Builds the driver, installs `odin3-linux` + `otter` + the menu entry, and
-writes the udev rule so **nothing has to run as root at flash time**. It also
-tells you if PyGObject/GTK3 is missing — the driver still works without it.
+It works from a clean machine with nothing cloned:
+
+1. **detects the distribution** and its package manager — Debian/Ubuntu
+   (`apt`), Fedora/RHEL (`dnf`/`yum`), Arch (`pacman`), openSUSE (`zypper`),
+   Alpine (`apk`); anything unrecognised is reported rather than guessed at
+2. **installs only what is missing** — if a compiler, make, the libusb
+   headers and the GTK bindings are already present it skips the package
+   manager entirely
+3. **clones and builds** the driver (or reuses the checkout you are already in)
+4. **puts `otter` and `odin3-linux` on PATH** — `/usr/local/bin` with sudo,
+   otherwise `~/.local/bin` with the PATH line added to your shell profile
+5. **installs the udev rule**, so flashing never needs root
+6. finishes with:
+
+   ```
+   ============================================================
+    Otter is installed.
+
+    Open a NEW terminal and type:
+
+        otter
+   ============================================================
+   ```
+
+**Already cloned?** `./setup.sh` detects the checkout and skips cloning.
+`./install.sh` is the build-and-install-only variant.
+
+**No password / custom prefix:** `OTTER_PREFIX=$HOME/.local ./setup.sh`
+— installs into a directory you own and prints the one udev command to run
+yourself.
 
 ## Production notes
 

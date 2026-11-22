@@ -740,7 +740,33 @@ def _paths(win):
     return [win.filers[k].get() for k, _ in SLOTS if win.filers[k].get()]
 
 
+USAGE = """Otter - GTK3 front end for the odin3-linux Samsung download-mode driver
+
+usage: otter [--help] [--version]
+
+Launch with no arguments; everything else happens in the window:
+
+  Refresh / Probe         identify the phone (one session per Download mode)
+  BL / AP / CP / CSC / UMS  pick firmware images
+  Start                   runs every safety gate, confirms, then flashes
+
+The driver is a separate program: `odin3-linux --help`.
+Full workflow: README.md
+"""
+
+
 def main():
+    args = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in args):
+        print(USAGE)
+        return 0
+    if any(a in ("-V", "--version") for a in args):
+        print("otter 1.0 - Odin3 3.14.4 download protocol")
+        return 0
+    if args:
+        print("otter: unknown argument %r (try --help)" % args[0], file=sys.stderr)
+        return 2
+
     win = Otter()
     win.show_all()
     # after the first layout pass, so real allocations exist to measure
