@@ -316,12 +316,15 @@ static int read_device_info(odin_ctx *c, uint8_t **out, size_t *outlen)
         if (rc != ODIN_OK) goto fail;
         uint32_t want = size - i * ODIN_INFO_GRANULARITY;
         if (want > ODIN_INFO_GRANULARITY) want = ODIN_INFO_GRANULARITY;
+        c->t->wait_label = "device info data";
         if (c->t->read_all(c->t, buf + (size_t)i * ODIN_INFO_GRANULARITY,
-                           want, 30000) != ODIN_OK) {
+                           want, ODIN_READ_TIMEOUT_MS) != ODIN_OK) {
+            c->t->wait_label = NULL;
             rc = ODIN_ERR_IO;
             goto fail;
         }
     }
+    c->t->wait_label = NULL;
     rc = odin_request(c, ODIN_REQ_READ, ODIN_READ_END, NULL, 0, true, NULL);
     if (rc != ODIN_OK) goto fail;
 
@@ -355,12 +358,15 @@ static int read_device_pit(odin_ctx *c, uint8_t **out, size_t *outlen)
         if (rc != ODIN_OK) goto fail;
         uint32_t want = size - i * ODIN_INFO_GRANULARITY;
         if (want > ODIN_INFO_GRANULARITY) want = ODIN_INFO_GRANULARITY;
+        c->t->wait_label = "PIT data";
         if (c->t->read_all(c->t, buf + (size_t)i * ODIN_INFO_GRANULARITY,
-                           want, 30000) != ODIN_OK) {
+                           want, ODIN_READ_TIMEOUT_MS) != ODIN_OK) {
+            c->t->wait_label = NULL;
             rc = ODIN_ERR_IO;
             goto fail;
         }
     }
+    c->t->wait_label = NULL;
     rc = odin_request(c, ODIN_REQ_PIT, ODIN_PIT_END, NULL, 0, true, NULL);
     if (rc != ODIN_OK) goto fail;
 
@@ -1166,6 +1172,15 @@ int main(int argc, char **argv)
             for (size_t i = 0; i < g_slots[s].tar.count; i++) {
                 const tar_member *m = &g_slots[s].tar.members[i];
                 if (m->is_pit) continue;   /* Odin does not count it either */
+                if (g_verbose) {
+                    /* Reported because this is the field that must stay 64
+                     * bit: real firmware places members past 4 GiB, and a
+                     * truncated offset still clears every gate while reading
+                     * the wrong bytes.  tests/test_bigoffset.py pins it. */
+                    printf("  %-4s %-38.38s at byte %-12" PRIu64 " of %s\n",
+                           g_slots[s].label, m->name, m->data_offset,
+                           g_slots[s].path);
+                }
                 total += m->size;
             }
         }

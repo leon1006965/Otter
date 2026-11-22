@@ -90,11 +90,22 @@ int odin_handshake(odin_ctx *c)
         return ODIN_ERR_IO;
     }
 
-    /* FUN_10022b20 waits up to 300000 ms for EV_RXCHAR; we are far more
-     * impatient because a non-answering pipe must fail fast and safely. */
-    if (c->t->read_all(c->t, buf, 4, 5000) != ODIN_OK) {
-        fprintf(stderr, "[proto] handshake: no \"LOKE\" within 5 s on %s\n",
-                c->t->desc);
+    /* Same budget as every other read: FUN_10022b20 gives this 300000 ms
+     * too.  Cutting it short is what makes a merely-slow phone look like a
+     * spent session, so we wait Odin's full window - but say at IO_NOTE_MS
+     * what silence here normally means, so nobody sits through five minutes
+     * of it without knowing that interrupting is the right move. */
+    c->t->wait_label = "\"ODIN\" -> \"LOKE\" handshake";
+    c->t->wait_hint  = "a phone that can answer does so immediately; "
+                       "continued silence almost always means this "
+                       "Download-mode session is already spent - power the "
+                       "phone off and re-enter Download mode, or interrupt "
+                       "now (Ctrl-C)";
+    int waited_out = c->t->read_all(c->t, buf, 4, ODIN_READ_TIMEOUT_MS);
+    c->t->wait_hint = NULL;
+    if (waited_out != ODIN_OK) {
+        fprintf(stderr, "[proto] handshake: no \"LOKE\" within %d s on %s\n",
+                ODIN_READ_TIMEOUT_MS / 1000, c->t->desc);
         fprintf(stderr,
                 "        the phone is present but will not open a session.\n"
                 "        A Download-mode entry only allows ONE session, and it\n"
@@ -149,7 +160,9 @@ int odin_request(odin_ctx *c, uint32_t req, uint32_t sub,
         return ODIN_OK;                   /* Odin returns 0 here */
 
     uint8_t rsp[ODIN_RESP_BYTES];
-    if (c->t->read_all(c->t, rsp, ODIN_RESP_BYTES, 60000) != ODIN_OK) {
+    c->t->wait_label = "a command response";
+    if (c->t->read_all(c->t, rsp, ODIN_RESP_BYTES,
+                       ODIN_READ_TIMEOUT_MS) != ODIN_OK) {
         fprintf(stderr, "[proto] no response for req=%u sub=%u\n", req, sub);
         return ODIN_ERR_IO;
     }
@@ -190,7 +203,9 @@ int odin_data_block(odin_ctx *c, const uint8_t *buf, uint32_t len)
     c->bytes_written += len;
 
     uint8_t rsp[ODIN_RESP_BYTES];
-    if (c->t->read_all(c->t, rsp, ODIN_RESP_BYTES, 120000) != ODIN_OK) {
+    c->t->wait_label = "a block acknowledgement";
+    if (c->t->read_all(c->t, rsp, ODIN_RESP_BYTES,
+                       ODIN_READ_TIMEOUT_MS) != ODIN_OK) {
         fprintf(stderr, "[proto] no acknowledgement after a %u byte data block\n", len);
         return ODIN_ERR_IO;
     }

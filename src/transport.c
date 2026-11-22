@@ -55,11 +55,31 @@ static int ser_write_all(odin_transport *t, const uint8_t *buf, size_t len)
 
 static int ser_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout_ms)
 {
+    /* Wait in slices, not one blocking poll: the total budget is what Odin
+     * allows (FUN_10022b20 -> WaitForSingleObject(..., 0x493e0)), but a user
+     * staring at a silent console needs to be told that we are still trying
+     * rather than left to assume the driver hung. */
     size_t off = 0;
+    int waited = 0, noted = 0;
     while (off < len) {
+        int budget = timeout_ms - waited;
+        if (budget <= 0) break;
+        int ask = budget < IO_SLICE_MS ? budget : IO_SLICE_MS;
         struct pollfd p = { .fd = t->fd, .events = POLLIN };
-        int r = poll(&p, 1, timeout_ms);
-        if (r == 0) return ODIN_ERR_IO;          /* timed out */
+        int r = poll(&p, 1, ask);
+        if (r == 0) {
+            waited += ask;
+            if (!noted && waited >= IO_NOTE_MS) {
+                fprintf(stderr, "[io] still waiting for %s (%zu of %zu bytes) "
+                        "after %d s...\n",
+                        t->wait_label ? t->wait_label : "the device",
+                        off, len, waited / 1000);
+                if (t->wait_hint)
+                    fprintf(stderr, "        %s\n", t->wait_hint);
+                noted = 1;
+            }
+            continue;
+        }
         if (r < 0) {
             if (errno == EINTR) continue;
             return ODIN_ERR_IO;
@@ -71,6 +91,15 @@ static int ser_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
         }
         if (n == 0) return ODIN_ERR_IO;
         off += (size_t)n;
+        waited = 0;
+        noted = 0;              /* progress restarts the budget, as it does for Odin */
+    }
+    if (off < len) {
+        fprintf(stderr, "[io] no data from %s after %d s (Odin allows %d s) "
+                        "- giving up\n",
+                t->wait_label ? t->wait_label : "the device",
+                timeout_ms / 1000, ODIN_READ_TIMEOUT_MS / 1000);
+        return ODIN_ERR_IO;
     }
     return ODIN_OK;
 }
@@ -147,7 +176,7 @@ static int usb_write_all(odin_transport *t, const uint8_t *buf, size_t len)
         int n = 0;
         int rc = libusb_bulk_transfer(s->h, s->ep_out,
                                       (unsigned char *)(uintptr_t)(buf + off),
-                                      (int)(len - off), &n, 10000);
+                                      (int)(len - off), &n, ODIN_WRITE_TIMEOUT_MS);
         if (rc != 0) {
             fprintf(stderr, "[usb] bulk OUT 0x%02x failed after %zu/%zu bytes: %s\n",
                     s->ep_out, off, len, libusb_error_name(rc));
@@ -161,13 +190,32 @@ static int usb_write_all(odin_transport *t, const uint8_t *buf, size_t len)
 
 static int usb_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout_ms)
 {
+    /* Sliced for the same reason as ser_read_all: honour Odin's overall
+     * budget, but say something before a long silent wait looks like a hang. */
     struct usb_state *s = t->usb;
     size_t off = 0;
+    int waited = 0, noted = 0;
     while (off < len) {
+        int budget = timeout_ms - waited;
+        if (budget <= 0) break;
+        int ask = budget < IO_SLICE_MS ? budget : IO_SLICE_MS;
         int n = 0;
         int rc = libusb_bulk_transfer(s->h, s->ep_in,
                                       (unsigned char *)(uintptr_t)(buf + off),
-                                      (int)(len - off), &n, timeout_ms);
+                                      (int)(len - off), &n, ask);
+        if (rc == LIBUSB_ERROR_TIMEOUT) {
+            waited += ask;
+            if (!noted && waited >= IO_NOTE_MS) {
+                fprintf(stderr, "[io] still waiting for %s (%zu of %zu bytes) "
+                        "after %d s...\n",
+                        t->wait_label ? t->wait_label : "the device",
+                        off, len, waited / 1000);
+                if (t->wait_hint)
+                    fprintf(stderr, "        %s\n", t->wait_hint);
+                noted = 1;
+            }
+            continue;
+        }
         if (rc != 0) {
             fprintf(stderr, "[usb] bulk IN 0x%02x failed after %zu/%zu bytes: %s\n",
                     s->ep_in, off, len, libusb_error_name(rc));
@@ -175,6 +223,15 @@ static int usb_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
         }
         if (n <= 0) return ODIN_ERR_IO;
         off += (size_t)n;
+        waited = 0;
+        noted = 0;              /* progress restarts the budget, as it does for Odin */
+    }
+    if (off < len) {
+        fprintf(stderr, "[io] no data from %s after %d s (Odin allows %d s) "
+                        "- giving up\n",
+                t->wait_label ? t->wait_label : "the device",
+                timeout_ms / 1000, ODIN_READ_TIMEOUT_MS / 1000);
+        return ODIN_ERR_IO;
     }
     return ODIN_OK;
 }

@@ -144,7 +144,7 @@ int tar_open(const char *path, tar_archive *out, char *err, size_t errlen)
 
         tar_member m;
         memset(&m, 0, sizeof(m));
-        m.hdr_offset = (uint32_t)off;
+        m.hdr_offset = off;
 
         /* name: bytes 0..99, but ustar splits it as prefix/ name at 345 */
         char raw[101];
@@ -175,7 +175,7 @@ int tar_open(const char *path, tar_archive *out, char *err, size_t errlen)
         if (rc != ODIN_OK) { tar_close(out); return rc; }
 
         m.size = sz;
-        m.data_offset = (uint32_t)(off + TAR_BLOCK);
+        m.data_offset = off + TAR_BLOCK;
         m.is_pit = (strcmp(m.name, "PIT") == 0);
 
         uint64_t step = TAR_BLOCK + ((sz + TAR_BLOCK - 1) / TAR_BLOCK) * TAR_BLOCK;

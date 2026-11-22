@@ -201,8 +201,13 @@ def main():
     win.checks["AP"].set_active(True)
     win._update_actions()
     win.running = True; win._update_actions()
-    check("Start disabled while a command runs", not win.btn_start.get_sensitive())
+    check("Start becomes an armed Stop while a command runs",
+          win.btn_start.get_sensitive() and win.btn_start.get_label() == "Stop",
+          "%s / %s" % (win.btn_start.get_sensitive(),
+                       win.btn_start.get_label()))
     win.running = False; win._update_actions()
+    check("Stop reverts to Start when idle",
+          win.btn_start.get_label() == "Start", win.btn_start.get_label())
 
     # ---- 5. options --------------------------------------------------------
     on = [k for k, cb in win.flags.items() if cb.get_active()]
@@ -234,6 +239,24 @@ def main():
     check("progress reaches 100%",
           win.bar.get_fraction() == 1.0 and win.bytes_lbl.get_text() == "100 B / 100 B",
           win.bytes_lbl.get_text())
+
+    # ---- 6b. long-wait diagnostics are classified, not left plain ---------
+    # The driver waits Odin's full 300 s now, so these lines are how a user
+    # tells "still trying" from "gave up" while watching the log.
+    check("[io] waiting line is a warning, not an error",
+          win._tag_for('[io] still waiting for a command response (0 of 8 '
+                       'bytes) after 20 s...') == "warn",
+          win._tag_for('[io] still waiting for a command response (0 of 8 '
+                       'bytes) after 20 s...'))
+    check("[io] give-up line is an error",
+          win._tag_for('[io] no data from a command response after 300 s '
+                       '(Odin allows 300 s) - giving up') == "err",
+          win._tag_for('[io] no data from a command response after 300 s '
+                       '(Odin allows 300 s) - giving up'))
+    win._line('[io] still waiting for "ODIN" -> "LOKE" handshake '
+              '(0 of 4 bytes) after 20 s...')
+    check("[io] lines reach the log", "still waiting" in log_of(win),
+          log_of(win)[-200:])
 
     win.plan_rows = []
     win._line("OTTER\tPLAN\tAP\trecovery.img\t8\tRECOVERY\t62644240\t67108864\t31457280")
@@ -343,6 +366,46 @@ def main():
     check("successful flash gets a closing popup",
           len(dialogs) == 1 and "Flash complete" in dialogs[0], str(dialogs))
     dialogs[:] = []; bodies[:] = []
+
+    # ---- 7b2. interrupting a long wait is a choice, not a failure ---------
+    # The driver waits Odin's full 300 s for a response, so Stop is the only
+    # way out of that window.  It must not be reported as a fault, must not
+    # pop a failure dialog, and must say what state the phone is left in.
+    class FakeProc:
+        def __init__(self):
+            self.terminated = self.killed = False
+        def terminate(self): self.terminated = True
+        def kill(self):      self.killed = True
+        def poll(self):      return None
+
+    win.kind = "flash"
+    win._interrupted = False
+    win.proc = FakeProc()
+    before = len(log_of(win))
+    win._on_stop()
+    log = log_of(win)
+    check("Stop terminates the running driver", win.proc.terminated)
+    check("Stop marks the run interrupted", win._interrupted)
+    check("Stop says the phone stays in Download mode",
+          "stays in Download mode" in log[before:], log[before:])
+    check("Stop is not logged as a failure",
+          "failed (exit" not in log[before:], log[before:])
+
+    dialogs[:] = []; bodies[:] = []
+    win.bar.set_fraction(0.3); win.bar.set_text("working")
+    win.rec = {}
+    mark = len(log_of(win))              # only what this run adds
+    win._done(-15)                       # what SIGTERM actually yields
+    added = log_of(win)[mark:]
+    check("an interrupted run is not reported as failed",
+          "failed (exit" not in added, added[-300:])
+    check("an interrupted run shows no failure popup", dialogs == [],
+          str(dialogs))
+    check("progress bar reads 'stopped', not 'failed'",
+          win.bar.get_text() == "stopped", win.bar.get_text())
+    check("interrupt returns the button to Start",
+          win.btn_start.get_label() == "Start", win.btn_start.get_label())
+    win._interrupted = False
 
     # ---- 7c. production behaviour: heuristics warn, they do not block -----
     # The phone-independent checks live in the CLI, so exercise them directly.

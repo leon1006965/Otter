@@ -129,7 +129,7 @@ is always shown in the title bar subtitle.
 `odin3-linux`, so every safety gate lives in exactly one place and the GUI
 cannot route around it. It talks to the CLI through `--machine`, which emits
 tab-separated `OTTER` records (`IDENTITY`, `PITCOUNT`, `PLAN`, `CONFIRM`,
-`TOTAL`) that the GUI parses into the table.
+`SKIP`, `TOTAL`) that the GUI parses into the table.
 
 Two rules the GUI enforces on top of the CLI:
 
@@ -138,12 +138,19 @@ Two rules the GUI enforces on top of the CLI:
 * The **"Dangerous options"** expander starts collapsed with every flag off,
   and the one-session-per-Download-mode-entry warning is pinned to the top.
 
+Because the driver waits Odin's own 300 s for a response, **Start turns into
+Stop** while a command runs: a phone that has gone quiet would otherwise hold
+the window for minutes with no way out. Interrupting mid-write is safe — the
+driver sends no further command, the phone keeps the bytes it already has and
+stays in Download mode, which is exactly the state a failed run leaves. An
+interrupt is logged as a choice, never as a failure.
+
 Layout note: the plan/safety/log sizes are calibrated so nothing important is
 hidden behind a desktop panel on a 768 px-tall screen — if you change
 `CSD_OVERHEAD`, re-check with a screenshot.
 
 ```sh
-make test      # 6 CLI fixtures + 2 override paths + 29 GUI checks, no phone
+make test      # 15 CLI fixture checks + 62 GUI checks + 9 offset checks
 ```
 
 ---
@@ -166,6 +173,8 @@ the following hold.
 | every input must be a real `ustar` archive with sizes that fit the file | Odin does not check the magic; refusing a bad archive is the safe direction |
 | any command whose echoed request id does not match aborts immediately | Odin returns `0x80000000` and stops the pipeline; the driver does the same and sends nothing further |
 | image must fit the partition | `size ≤ raw+24 × 4096`, the PIT's capacity field (unit confirmed by the successful test flash) — overridable with `--allow-oversize` |
+| every response and block acknowledgement gets Odin's own `300000 ms` | `FUN_10022b20` @ `0x10022b53` does `WaitForSingleObject(…, 0x493e0)`. Earlier guesses of 60 s / 120 s made a healthy device look dead mid-flash; the binary's number is used instead. Long waits report themselves rather than sitting silent. Writes, which Odin blocks on indefinitely (`GetOverlappedResult(…, bWait=TRUE)` @ `0x100230a1`), are bounded at the same figure so a dead link can never hang the driver |
+| tar member offsets are 64-bit and pinned by `_Static_assert` | real firmware puts members past 4 GiB (`boot.img` at byte 9 126 808 064). A 32-bit offset wraps into another member's payload **and still clears every gate**, because the gates compare the same wrapped value — so the field width is enforced at compile time, `plan --verbose` prints each offset, and `tests/test_bigoffset.py` covers it |
 | file name vs device model | when **both** the input filename and the device identity carry a Samsung model token they must agree (`AP_G991B…` vs `SM-G991B`). **Warns by default** — it is a heuristic read off a file name, and a false positive must never block a model we have never seen. `--strict-model` makes it a refusal, `--expect-model` pins the device, `--allow-model-mismatch` silences it. If neither side carries a token (most custom recoveries) nothing is checked |
 | boot-critical partitions | boot-chain partitions are denied by default. The shipped names come from one phone's PIT, so **other models add their own** in `~/.config/odin3-critical` (one name per line, `#` starts a comment) instead of us guessing names we have never seen |
 | LZ4 members are decompressed, not refused | the codec is the reference implementation vendored from `github.com/lz4/lz4` **v1.11.1** (BSD-2-Clause, `third_party/lz4/`); framing is implemented here for both the frame (`04 22 4d 18`) and legacy (`02 21 4c 18`) containers. A container with **no recognisable header** — a raw LZ4 block — is refused, because its member boundaries cannot be found without guessing |
@@ -227,11 +236,19 @@ and remains in Download mode.
 ## Tests
 
 ```sh
+make test     # fixtures + CLI gates + GUI checks + 64-bit offset check
+```
+
+or by hand:
+
+```sh
 python3 tests/make_fixtures.py     # synthetic PIT + tars, no device needed
 ./odin3-linux pitdump --pit tests/test.pit
 ./odin3-linux plan    --ap tests/test.tar     --pit tests/test.pit   # expect OK
-./odin3-linux plan    --ap tests/bad.tar      --pit tests/test.pit   # expect refusal (unmapped member)
+./odin3-linux plan    --ap tests/none.tar     --pit tests/test.pit   # expect refusal (nothing maps)
 ./odin3-linux plan    --ap tests/zerodiv.tar  --pit tests/test.pit   # expect refusal (div-by-zero entry)
+./odin3-linux plan    --ap tests/partial.tar  --pit tests/test.pit   # expect OK + "NOT flashed" report
+python3 tests/test_bigoffset.py    # members past 4 GiB keep exact offsets
 ```
 
 These exercise the parser and the gates. They do **not** exercise the wire
@@ -276,6 +293,12 @@ protocol session per entry into Download mode. After a session ends — even
 with a proper `103/0` close — the next `ODIN` handshake gets no `LOKE`.
 Cable replug, `libusb_reset_device`, and waiting do not recover it; only
 power-cycling and re-entering Download mode does.
+
+Because Odin allows a full 300 s for that handshake (§17 of the RE notes), a
+phone with a spent session is silent rather than quick to refuse. The driver
+waits the same window, but says so after about 15 s and explains that
+continued silence almost always means the session is spent — so you can
+interrupt instead of watching a progress-free console for five minutes.
 
 So the workflow is three steps:
 

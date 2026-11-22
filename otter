@@ -123,6 +123,7 @@ class Otter(Gtk.Window):
         self._pulse = None
         self._have_progress = False
         self._loke_fail = False
+        self._interrupted = False
         self.pit_path = os.path.join(GLib.get_user_cache_dir(), "otter-device.pit")
 
         header = Gtk.HeaderBar(title="Otter")
@@ -267,7 +268,8 @@ class Otter(Gtk.Window):
         self.btn_start = Gtk.Button(label="Start")
         self.btn_start.get_style_context().add_class("suggested-action")
         self.btn_start.set_size_request(140, 36)
-        self.btn_start.connect("clicked", lambda *_: self._on_start())
+        self.btn_start.connect("clicked", lambda *_: self._on_stop()
+                               if self.running else self._on_start())
         pr.pack_start(self.btn_start, False, False, 0)
         outer.pack_start(pr, False, False, 0)
 
@@ -441,9 +443,11 @@ class Otter(Gtk.Window):
         self.logbuf.delete_mark(mark)
 
     def _tag_for(self, line):
-        if line.startswith("error:") or "refus" in line or "failed" in line:
+        if line.startswith("error:") or "refus" in line or "failed" in line \
+                or line.startswith("[io] no data from"):
             return "err"
-        if line.startswith(("[usb]", "[proto]", "[pit]", "[otter]", "warning")):
+        if line.startswith(("[usb]", "[proto]", "[pit]", "[otter]", "[io]",
+                            "warning")):
             return "warn"
         if line.startswith("OTTER"):
             return None
@@ -464,6 +468,7 @@ class Otter(Gtk.Window):
             self.devlist = []
         self.plan_rows = []          # always recompute, never reuse
         self.skip_rows = []
+        self._interrupted = False
         self.running = True
         self._have_progress = False
         self._update_actions()
@@ -557,6 +562,11 @@ class Otter(Gtk.Window):
                 self._popup_flash_done()
             elif kind == "plan":
                 self._set_status("plan checked")
+        elif self._interrupted:
+            # already logged by _on_stop; an interrupt is a choice, not a
+            # fault, so it must not be reported as a failure nor trigger one
+            if self.bar.get_fraction() < 1.0:
+                self.bar.set_text("stopped")
         else:
             self._log("[otter] failed (exit %s) - see the log; nothing further "
                       "was sent" % rc, "err")
@@ -745,13 +755,57 @@ class Otter(Gtk.Window):
 
     # --------------------------------------------------------------- state
 
+    def _on_stop(self):
+        """Interrupt a running command.
+
+        The driver now waits Odin's full 300 s for a response, so a phone
+        that has gone quiet can hold the window for minutes with nothing to
+        look at.  Interrupting mid-write is safe in the sense that matters:
+        the driver sends no further command, the phone keeps whatever it has
+        and stays in Download mode - exactly the state a failed run leaves.
+        """
+        p = self.proc
+        if p is None:
+            return
+        kind = self.kind
+        self._interrupted = True
+        self._log("[otter] interrupted by the user" +
+                  ("" if kind != "flash" else
+                   " - the phone keeps the bytes already written and stays "
+                   "in Download mode; re-enter Download mode before retrying"),
+                  "warn")
+        self._set_status("interrupted")
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+        # If it does not exit promptly it is wedged inside a read; escalate
+        # rather than leave the window spinning forever.
+        def force():
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        t = threading.Timer(3.0, force)
+        t.daemon = True                 # never hold the process open for us
+        t.start()
+
     def _update_actions(self):
         if not hasattr(self, "btn_start"):
             return
-        ok = (not self.running and bool(self.driver) and bool(self._slot_args())
-              and bool(self.identity))
+        if self.running:
+            # Odin bounds every read at 300 s; the button must be the way out
+            # of that wait rather than greyed out for its whole length.
+            self.btn_start.set_sensitive(True)
+            self.btn_start.set_label("Stop")
+            self.btn_start.get_style_context().add_class("destructive-action")
+            return
+        self.btn_start.get_style_context().remove_class("destructive-action")
+        ok = bool(self.driver) and bool(self._slot_args()) and bool(self.identity)
         self.btn_start.set_sensitive(ok)
-        self.btn_start.set_label("Flashing…" if self.running else "Start")
+        self.btn_start.set_label("Start")
 
     def _start_pulse(self):
         if self._pulse:

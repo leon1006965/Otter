@@ -80,6 +80,22 @@
 /* FUN_1001fe90 @ 0x1001ff3a: default packet size when the configured value
  * is < 0x20000.  Odin_SetPacketSize only accepts 0x400000 / 0x800000. */
 #define ODIN_DEFAULT_PACKET_SIZE 0x100000u
+/* Read ceiling.  FUN_10022b20 @ 0x10022b53 does
+ *     WaitForSingleObject(hEvent, 0x493e0)   ; 300000 ms
+ * and every response, every data-block ack and the ODIN/LOKE handshake go
+ * through that one function.  Our earlier 60 s / 120 s figures were guesses;
+ * they are what made a busy device look dead at 102/3. */
+#define ODIN_READ_TIMEOUT_MS   300000
+/* Writes: FUN_10023050 @ 0x100230a1 calls GetOverlappedResult(..., bWait=TRUE)
+ * with no timeout at all, so Odin blocks indefinitely.  We stay bounded rather
+ * than hang forever, but well past the point where a healthy link needs. */
+#define ODIN_WRITE_TIMEOUT_MS  300000
+/* Long waits are reported instead of sitting silent: poll in slices of this
+ * many ms and say so once the total reaches IO_NOTE_MS.  The slice must
+ * divide IO_NOTE_MS, or the note lands a slice late and the stated figure is
+ * a lie - 15000 / 5000 reports at exactly 15 s. */
+#define IO_SLICE_MS              5000
+#define IO_NOTE_MS              15000
 /* ODIN_DATA_LEN rounding: LEA EAX,[EDI-1]; SHR EAX,0x11; INC; SHL EAX,0x11 */
 #define ODIN_LEN_ALIGNMENT       0x20000u
 /* FUN_10020fc0: member type -> transfer chunk size */
@@ -130,6 +146,16 @@ struct odin_transport {
     int    (*read_all)(odin_transport *, uint8_t *, size_t, int timeout_ms);
     void   (*close)(odin_transport *);
     void   (*destroy)(odin_transport *);
+    /* What the pending read is waiting for ("the ODIN -> LOKE handshake",
+     * "a response", "a block acknowledgement").  Set by protocol.c right
+     * before each read so a long wait can be reported in words rather than
+     * as a bare byte count.  Not part of any wire state. */
+    const char *wait_label;
+    /* Optional second line for that report: what the wait MEANS.  The
+     * handshake sets it so a silent phone - a spent Download-mode session,
+     * which never answers at all - is diagnosed after IO_NOTE_MS instead of
+     * after the full 300 s ceiling. */
+    const char *wait_hint;
     char     desc[160];
 };
 
@@ -202,8 +228,13 @@ uint64_t pit_start_bytes(const pit_entry *e);
 typedef struct {
     char     name[256];
     uint64_t size;           /* bytes on disk (compressed when compressed)    */
-    uint32_t hdr_offset;     /* byte offset of this 512-byte header           */
-    uint32_t data_offset;    /* byte offset of the payload                    */
+    /* 64-bit, not 32: a real AP tar stores boot.img at byte 9,126,808,064,
+     * past 4 GiB.  Truncating that to uint32_t yields 536,873,472 - a pointer
+     * into the middle of super.img - and every gate compares the truncated
+     * value, so the plan passes and the boot partition would receive another
+     * partition's bytes. */
+    uint64_t hdr_offset;     /* byte offset of this 512-byte header           */
+    uint64_t data_offset;    /* byte offset of the payload                    */
     bool     is_pit;         /* member literally named "PIT"                  */
     bool     compressed;     /* payload is LZ4 inside the tar                 */
     uint64_t unc_size;       /* bytes to send; == size when not compressed    */
@@ -254,6 +285,15 @@ typedef struct {
 
 int  tar_open(const char *path, tar_archive *out, char *err, size_t errlen);
 void tar_close(tar_archive *t);
+
+/* Compile-time pin: firmware legitimately stores members past 4 GiB (a real
+ * AP tar has boot.img at byte 9,126,808,064).  Narrowing either offset to
+ * 32 bits wraps it to a pointer inside another member, and every safety gate
+ * still passes because they all compare the same wrapped value. */
+_Static_assert(sizeof(((tar_member *)0)->data_offset) == 8,
+               "tar_member.data_offset must be 64 bit");
+_Static_assert(sizeof(((tar_member *)0)->hdr_offset) == 8,
+               "tar_member.hdr_offset must be 64 bit");
 
 /* ------------------------------------------------------------------- plan */
 typedef struct {

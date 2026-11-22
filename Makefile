@@ -47,6 +47,7 @@ test: odin3-linux
 	@./odin3-linux plan --ap tests/big.tar --pit tests/test.pit --allow-oversize >/dev/null 2>&1 \
 		&& echo "  pass  oversize override" || { echo "  FAIL  oversize override"; exit 1; }
 	@python3 tests/test_otter.py
+	@python3 tests/test_bigoffset.py
 
 clean:
 	rm -f $(OBJS) odin3-linux

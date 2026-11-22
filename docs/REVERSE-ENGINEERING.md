@@ -626,3 +626,91 @@ ends — including one closed with the proper `103/0` — a new `ODIN` handshake
 receives no `LOKE`. Cable replug, `libusb_reset_device`, and elapsed time do
 not recover it; only power-cycling back into Download mode does. Odin never
 shows this because it performs a single session per run.
+
+---
+
+## 17. Timeouts — one number, `300000`, for every read
+
+Every read in the protocol goes through `FUN_10022b20` @ `0x10022b20`, and its
+waiting is fixed:
+
+```asm
+0x10022b4c  CMP EAX, 0x3e5            ; ERROR_IO_PENDING
+0x10022b51  JNE 0x10022bb8            ; not pending -> done or fail
+0x10022b53  PUSH 0x493e0              ; 300000 ms = 5 minutes
+0x10022b58  PUSH dword ptr [EBX+0x50] ; the overlapped event
+0x10022b5B  CALL WaitForSingleObject
+```
+
+That single constant covers the `"ODIN"` → `"LOKE"` handshake (4 bytes),
+every command response (8 bytes), every data-block acknowledgement (8 bytes),
+and each 500-byte device-info / PIT chunk — because `FUN_1001b750`,
+`FUN_1001b890`, `FUN_10020810` and `FUN_10020090` all reach it.
+
+Two waits *inside* the loop are gated off in practice and must not be
+"restored":
+
+| site | instruction | condition | value in this driver |
+|---|---|---|---|
+| `0x1001b8c6` | `Sleep(5)` before each block ack read | `ctx[0x1968] != 0` | never — see below |
+| `0x10022b7e` | `Sleep(10)` inside the read helper | 4th arg `!= 0` | never — we pass 0 |
+
+`ctx[0x1968]` has exactly **one** write in the whole module:
+
+```asm
+0x10018a14  MOV byte ptr [EDI+0x1968], 0x0     ; the only write
+```
+
+It is initialised to 0 and never set, so `Sleep(5)` is dead code in the
+shipping binary. The ten other references are all reads. Adding a sleep
+there would be inventing behaviour the real tool does not have.
+
+Writes are different again: `FUN_10023050` @ `0x10023050` ends in
+
+```asm
+0x10023097  PUSH 0x1                       ; bWait = TRUE
+0x100230a1  CALL GetOverlappedResult       ; no timeout argument at all
+```
+
+so Odin's `WriteFile` waits indefinitely. The driver bounds it at
+`ODIN_WRITE_TIMEOUT_MS` (still 300000) rather than hang forever — a deliberate
+and documented divergence, since an unbounded wait cannot be interrupted by a
+gate or a progress watchdog.
+
+**Why this mattered:** an earlier build used 60000 ms for responses and 120000
+ms for block acks. A real 9.13 GB flash logged `no response for req=102 sub=3`
+after two chunks — the device was simply taking longer than 60 s to commit
+30 MiB, well inside what Odin allows. The fix was to use the binary's number,
+not a larger guess.
+
+---
+
+## 18. Member offsets must be 64-bit
+
+A real AP tar (`AP_EliteUI8.tar`, 8.63 GiB) stores its members at:
+
+| member | payload offset |
+|---|---|
+| `super.img` | 2 048 |
+| `boot.img` | 9 126 808 064 |
+| `vendor_boot.img` | 9 193 917 440 |
+
+`boot.img` and `vendor_boot.img` are **past the 4 GiB boundary**. Storing
+`tar_member.data_offset` in 32 bits wraps `9126808064` to `536873472`, which
+is a location inside `super.img`'s payload. The consequence is worse than a
+crash: every safety gate compares `data_offset + size` against the archive
+size using that *same wrapped value*, so `536873472 + 67108864 = 603982336`
+passes comfortably, the plan prints normally, and the boot partition would
+have received 64 MiB of another partition's bytes.
+
+There is no gate that can catch this, because the gate and the read share the
+field. It is therefore prevented structurally instead:
+
+* `_Static_assert` in `include/odin.h` pins both fields to 8 bytes, so the
+  build fails if either is narrowed again;
+* `plan --verbose` prints each member's byte offset, so a wrapped value is
+  visible rather than silent;
+* `tests/test_bigoffset.py` builds a sparse archive whose second member sits
+  past 4 GiB and asserts the reported offset is exact.
+
+The `hdr_offset` field has the same width requirement for the same reason.
