@@ -258,6 +258,40 @@ def main():
     check("[io] lines reach the log", "still waiting" in log_of(win),
           log_of(win)[-200:])
 
+    # A stalled write is the case that used to look exactly like a hang: the
+    # bar sat still and the log stayed empty.  It must reach both the status
+    # line and the bar, and must keep the byte count visible.
+    win.bar.set_fraction(0.0102); win.bar.set_text("1%")
+    win.bytes_lbl.set_text("90.0 MiB / 8.6 GiB")
+    win.running = True
+    win._line("[io] still writing to the device (0 of 1024 bytes) after 15 s"
+              " - a command")
+    check("write stall is surfaced in the status line",
+          "still writing" in (win.header.get_subtitle() or ""),
+          win.header.get_subtitle())
+    check("write stall marks the bar as waiting, not progressing",
+          win.bar.get_text() == "waiting…", win.bar.get_text())
+    check("write stall keeps the fraction and byte count",
+          abs(win.bar.get_fraction() - 0.0102) < 1e-6
+          and win.bytes_lbl.get_text() == "90.0 MiB / 8.6 GiB",
+          "%s / %s" % (win.bar.get_fraction(), win.bytes_lbl.get_text()))
+    check("write stall is tagged as a warning",
+          win._tag_for("[io] still writing to the device (0 of 1024 bytes) "
+                       "after 15 s - a command") == "warn",
+          win._tag_for("[io] still writing to the device (0 of 1024 bytes) "
+                       "after 15 s - a command"))
+    check("write give-up is tagged as an error",
+          win._tag_for("[io] the device stopped accepting data after 300 s "
+                       "(Odin allows 300 s) - giving up") == "err",
+          win._tag_for("[io] the device stopped accepting data after 300 s "
+                       "(Odin allows 300 s) - giving up"))
+    # and a real progress record must take the label back from "waiting…"
+    win._line("OTTER\tPROGRESS\t185000000\t9261023232")
+    check("the next progress record restores the percentage",
+          win.bar.get_text() != "waiting…" and win.bar.get_text().endswith("%"),
+          win.bar.get_text())
+    win.running = False
+
     win.plan_rows = []
     win._line("OTTER\tPLAN\tAP\trecovery.img\t8\tRECOVERY\t62644240\t67108864\t31457280")
     check("plan record captured for the confirm dialog", len(win.plan_rows) == 1

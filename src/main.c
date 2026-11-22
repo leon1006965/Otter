@@ -483,12 +483,21 @@ static int build_mapping(const pit_file *pit)
 }
 
 /* Sum of what will actually be transmitted - the uncompressed sizes. */
+/* Bytes this member contributes to the progress total.  Must agree with
+ * map_total() and with what flash_member() reports: the total is the sum of
+ * these, so advancing the running base by anything else (the compressed
+ * on-disk size, for a member the driver decompresses) makes the bar jump
+ * backwards when an LZ4 member finishes. */
+static uint64_t member_payload(const tar_member *m)
+{
+    return m->unc_size ? m->unc_size : m->size;
+}
+
 static uint64_t map_total(void)
 {
     uint64_t t = 0;
     for (size_t i = 0; i < g_map_count; i++)
-        t += g_map[i].member->unc_size ? g_map[i].member->unc_size
-                                       : g_map[i].member->size;
+        t += member_payload(g_map[i].member);
     return t;
 }
 
@@ -901,8 +910,7 @@ static void print_plan(const pit_file *pit, const char *identity,
         uint64_t cap = pit_capacity_bytes(it->target);
         /* What is transmitted, not what sits in the tar: for an LZ4 member
          * those differ, and the difference is the whole point. */
-        uint64_t payload = it->member->unc_size ? it->member->unc_size
-                                                : it->member->size;
+        uint64_t payload = member_payload(it->member);
         char caps[32];
         if (cap == 0) snprintf(caps, sizeof(caps), "(remainder)");
         else snprintf(caps, sizeof(caps), "%llu", (unsigned long long)cap);
@@ -930,7 +938,7 @@ static int flash_member(odin_ctx *c, const mapped_item *it)
     const tar_member *m = it->member;
     /* For a compressed member the tar holds the LZ4 stream and the phone gets
      * the raw image, so everything below is accounted in uncompressed bytes. */
-    uint64_t total = m->unc_size ? m->unc_size : m->size;
+    uint64_t total = member_payload(m);
     uint64_t sent = 0;
     uint8_t *buf = malloc(c->packet_size);
     if (!buf) return ODIN_ERR_IO;
@@ -1510,7 +1518,7 @@ int main(int argc, char **argv)
                     g_err[0] ? g_err : odin_strerror(rc), g_map[i].member->name);
             pit_free(&pit); t.destroy(&t); return 1;
         }
-        g_prog_base += g_map[i].member->size;
+        g_prog_base += member_payload(g_map[i].member);
         mprogress(g_prog_base);
     }
     mprogress(total);

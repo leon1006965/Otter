@@ -444,7 +444,8 @@ class Otter(Gtk.Window):
 
     def _tag_for(self, line):
         if line.startswith("error:") or "refus" in line or "failed" in line \
-                or line.startswith("[io] no data from"):
+                or line.startswith(("[io] no data from",
+                                    "[io] the device stopped accepting")):
             return "err"
         if line.startswith(("[usb]", "[proto]", "[pit]", "[otter]", "[io]",
                             "warning")):
@@ -513,6 +514,20 @@ class Otter(Gtk.Window):
                     self.bytes_lbl.set_text("%s / %s" % (fmt(done), fmt(total)))
             else:
                 self.rec[key] = "\t".join(parts[2:])
+            return False
+        # The driver reports a long wait instead of sitting silent.  Mirror it
+        # in the status line and on the bar, because a frozen percentage with
+        # a quiet log is indistinguishable from a hang - which is exactly what
+        # a stalled bulk OUT looked like before the write path reported too.
+        if line.startswith("[io] still"):
+            # The bar keeps its fraction (and the byte label keeps the exact
+            # count) - only the percentage text becomes "waiting…", so the
+            # difference between "progressing slowly" and "the device has
+            # stopped answering" is visible instead of both looking frozen.
+            self._set_status(line[len("[io] "):].rstrip("."))
+            if self.running:
+                self.bar.set_text("waiting…")
+            self._log(line, self._tag_for(line))
             return False
         if line.startswith('[proto] handshake: no "LOKE"'):
             self._loke_fail = True

@@ -84,6 +84,7 @@ int odin_handshake(odin_ctx *c)
     uint8_t buf[4];
     const char *hello = ODIN_HOST_HANDSHAKE;
 
+    c->t->wait_label = "the ODIN handshake";
     if (c->t->write_all(c->t, (const uint8_t *)hello, 4) != ODIN_OK) {
         fprintf(stderr, "[proto] handshake: could not send \"ODIN\" on %s\n",
                 c->t->desc);
@@ -146,6 +147,7 @@ int odin_request(odin_ctx *c, uint32_t req, uint32_t sub,
     for (uint32_t i = 0; i < nparams; i++)
         put_le32(pkt + 8 + 4 * i, params[i]);
 
+    c->t->wait_label = "a command";
     if (c->t->write_all(c->t, pkt, ODIN_CMD_BYTES) != ODIN_OK) {
         fprintf(stderr, "[proto] write failed for req=%u sub=%u\n", req, sub);
         return ODIN_ERR_IO;
@@ -195,6 +197,7 @@ int odin_request(odin_ctx *c, uint32_t req, uint32_t sub,
  * content Odin ignores.  We read it too so the pipe stays in step. */
 int odin_data_block(odin_ctx *c, const uint8_t *buf, uint32_t len)
 {
+    c->t->wait_label = "partition payload";
     if (c->t->write_all(c->t, buf, len) != ODIN_OK) {
         fprintf(stderr, "[proto] data write failed after %llu bytes\n",
                 (unsigned long long)c->bytes_written);

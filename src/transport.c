@@ -38,17 +38,52 @@
 
 /* ------------------------------------------------------------ serial pipe */
 
+/* Wait for writability in slices rather than calling write() straight into a
+ * full kernel buffer: a blocking write() there gives us no chance to say
+ * anything, and the tty path is Odin's own.  Polling first keeps the same
+ * "wait as long as it takes" semantics while staying reportable. */
 static int ser_write_all(odin_transport *t, const uint8_t *buf, size_t len)
 {
     size_t off = 0;
+    int waited = 0, noted = 0;
     while (off < len) {
+        int budget = ODIN_WRITE_TIMEOUT_MS - waited;
+        if (budget <= 0) break;
+        int ask = budget < IO_SLICE_MS ? budget : IO_SLICE_MS;
+        struct pollfd p = { .fd = t->fd, .events = POLLOUT };
+        int r = poll(&p, 1, ask);
+        if (r == 0) {
+            waited += ask;
+            if (!noted && waited >= IO_NOTE_MS) {
+                fprintf(stderr, "[io] still writing to the device (%zu of %zu "
+                        "bytes) after %d s%s%s\n", off, len, waited / 1000,
+                        t->wait_label ? " - " : "",
+                        t->wait_label ? t->wait_label : "");
+                if (t->wait_hint)
+                    fprintf(stderr, "        %s\n", t->wait_hint);
+                noted = 1;
+            }
+            continue;
+        }
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return ODIN_ERR_IO;
+        }
         ssize_t n = write(t->fd, buf + off, len - off);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN) continue;
             return ODIN_ERR_IO;
         }
         if (n == 0) return ODIN_ERR_IO;
         off += (size_t)n;
+        waited = 0;
+        noted = 0;
+    }
+    if (off < len) {
+        fprintf(stderr, "[io] the device stopped accepting data after %d s "
+                        "(Odin allows %d s) - giving up\n",
+                ODIN_WRITE_TIMEOUT_MS / 1000, ODIN_WRITE_TIMEOUT_MS / 1000);
+        return ODIN_ERR_IO;
     }
     return ODIN_OK;
 }
@@ -168,15 +203,39 @@ struct usb_state {
     int                  iface;
 };
 
+/* Writes are sliced and reported exactly like reads, and for the same reason.
+ * A bulk OUT that the phone stops accepting - which is what it does while it
+ * is committing a chunk to flash - blocks here for the whole write timeout
+ * with no output at all.  Before the timeouts were aligned with Odin this
+ * window was 10 s; aligning it made it 300 s, so leaving the write path
+ * unreported would have turned a short silent pause into a five-minute one
+ * with a frozen progress bar and an empty log. */
 static int usb_write_all(odin_transport *t, const uint8_t *buf, size_t len)
 {
     struct usb_state *s = t->usb;
     size_t off = 0;
+    int waited = 0, noted = 0;
     while (off < len) {
+        int budget = ODIN_WRITE_TIMEOUT_MS - waited;
+        if (budget <= 0) break;
+        int ask = budget < IO_SLICE_MS ? budget : IO_SLICE_MS;
         int n = 0;
         int rc = libusb_bulk_transfer(s->h, s->ep_out,
                                       (unsigned char *)(uintptr_t)(buf + off),
-                                      (int)(len - off), &n, ODIN_WRITE_TIMEOUT_MS);
+                                      (int)(len - off), &n, ask);
+        if (rc == LIBUSB_ERROR_TIMEOUT) {
+            waited += ask;
+            if (!noted && waited >= IO_NOTE_MS) {
+                fprintf(stderr, "[io] still writing to the device (%zu of %zu "
+                        "bytes) after %d s%s%s\n", off, len, waited / 1000,
+                        t->wait_label ? " - " : "",
+                        t->wait_label ? t->wait_label : "");
+                if (t->wait_hint)
+                    fprintf(stderr, "        %s\n", t->wait_hint);
+                noted = 1;
+            }
+            continue;
+        }
         if (rc != 0) {
             fprintf(stderr, "[usb] bulk OUT 0x%02x failed after %zu/%zu bytes: %s\n",
                     s->ep_out, off, len, libusb_error_name(rc));
@@ -184,6 +243,14 @@ static int usb_write_all(odin_transport *t, const uint8_t *buf, size_t len)
         }
         if (n <= 0) return ODIN_ERR_IO;
         off += (size_t)n;
+        waited = 0;
+        noted = 0;
+    }
+    if (off < len) {
+        fprintf(stderr, "[io] the device stopped accepting data after %d s "
+                        "(Odin allows %d s) - giving up\n",
+                ODIN_WRITE_TIMEOUT_MS / 1000, ODIN_WRITE_TIMEOUT_MS / 1000);
+        return ODIN_ERR_IO;
     }
     return ODIN_OK;
 }
