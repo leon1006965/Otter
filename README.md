@@ -1,7 +1,8 @@
-# odin3-linux
+# Otter
 
 A Linux driver for the Samsung **Odin download mode** protocol, derived by
-reverse engineering `Odin3_v3.14.4.exe` / `SS_DL.dll` (3.14.4).
+reverse engineering `Odin3_v3.14.4.exe` / `SS_DL.dll` (3.14.4), plus a GTK3
+front end laid out like Odin3 itself.
 
 Everything protocol-related here is backed by instruction-level evidence from
 the shipping binary — see [`docs/REVERSE-ENGINEERING.md`](docs/REVERSE-ENGINEERING.md)
