@@ -84,10 +84,30 @@ int odin_handshake(odin_ctx *c)
     uint8_t buf[4];
     const char *hello = ODIN_HOST_HANDSHAKE;
 
+    /* A write that never completes is a different fault from a read that
+     * never answers: the phone enumerated but is not taking bulk data at all,
+     * so not one byte was delivered and no session was opened.  Say so -
+     * the spent-session text below would send the user the wrong way. */
     c->t->wait_label = "the ODIN handshake";
-    if (c->t->write_all(c->t, (const uint8_t *)hello, 4) != ODIN_OK) {
+    c->t->wait_hint  = "the phone has enumerated but is not accepting bulk "
+                       "data - normally a previous run that was interrupted "
+                       "mid-transfer, or one still committing its payload; "
+                       "give it time, or power it off and re-enter Download "
+                       "mode (--usb-reset clears a wedged endpoint first)";
+    int sent = c->t->write_all(c->t, (const uint8_t *)hello, 4);
+    c->t->wait_hint = NULL;
+    if (sent != ODIN_OK) {
         fprintf(stderr, "[proto] handshake: could not send \"ODIN\" on %s\n",
                 c->t->desc);
+        fprintf(stderr,
+                "        the phone enumerated but never took the 4 bytes, so "
+                "nothing was delivered\n"
+                "        and no session was opened.  That is NOT the "
+                "spent-session case - the\n"
+                "        endpoint itself is not reading.  Wait if a previous "
+                "run was interrupted\n"
+                "        mid-write, otherwise power the phone off and "
+                "re-enter Download mode.\n");
         return ODIN_ERR_IO;
     }
 

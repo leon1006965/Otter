@@ -91,11 +91,15 @@
  * than hang forever, but well past the point where a healthy link needs. */
 #define ODIN_WRITE_TIMEOUT_MS  300000
 /* Long waits are reported instead of sitting silent: poll in slices of this
- * many ms and say so once the total reaches IO_NOTE_MS.  The slice must
- * divide IO_NOTE_MS, or the note lands a slice late and the stated figure is
- * a lie - 15000 / 5000 reports at exactly 15 s. */
+ * many ms, say so once the total reaches IO_NOTE_MS, and then repeat every
+ * IO_REPEAT_MS until the budget runs out.  A single note followed by four
+ * minutes of silence reads exactly like a hang - which is what made a stalled
+ * write look like one.  The slice must divide IO_NOTE_MS, or the first note
+ * lands a slice late and the stated figure is a lie: 15000 / 5000 reports at
+ * exactly 15 s. */
 #define IO_SLICE_MS              5000
 #define IO_NOTE_MS              15000
+#define IO_REPEAT_MS            60000
 /* ODIN_DATA_LEN rounding: LEA EAX,[EDI-1]; SHR EAX,0x11; INC; SHL EAX,0x11 */
 #define ODIN_LEN_ALIGNMENT       0x20000u
 /* FUN_10020fc0: member type -> transfer chunk size */

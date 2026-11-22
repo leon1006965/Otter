@@ -45,7 +45,7 @@
 static int ser_write_all(odin_transport *t, const uint8_t *buf, size_t len)
 {
     size_t off = 0;
-    int waited = 0, noted = 0;
+    int waited = 0, next_note = IO_NOTE_MS;
     while (off < len) {
         int budget = ODIN_WRITE_TIMEOUT_MS - waited;
         if (budget <= 0) break;
@@ -54,14 +54,14 @@ static int ser_write_all(odin_transport *t, const uint8_t *buf, size_t len)
         int r = poll(&p, 1, ask);
         if (r == 0) {
             waited += ask;
-            if (!noted && waited >= IO_NOTE_MS) {
+            if (waited >= next_note) {
                 fprintf(stderr, "[io] still writing to the device (%zu of %zu "
                         "bytes) after %d s%s%s\n", off, len, waited / 1000,
                         t->wait_label ? " - " : "",
                         t->wait_label ? t->wait_label : "");
                 if (t->wait_hint)
                     fprintf(stderr, "        %s\n", t->wait_hint);
-                noted = 1;
+                next_note = waited + IO_REPEAT_MS;
             }
             continue;
         }
@@ -77,12 +77,14 @@ static int ser_write_all(odin_transport *t, const uint8_t *buf, size_t len)
         if (n == 0) return ODIN_ERR_IO;
         off += (size_t)n;
         waited = 0;
-        noted = 0;
+        next_note = IO_NOTE_MS;
     }
     if (off < len) {
         fprintf(stderr, "[io] the device stopped accepting data after %d s "
                         "(Odin allows %d s) - giving up\n",
                 ODIN_WRITE_TIMEOUT_MS / 1000, ODIN_WRITE_TIMEOUT_MS / 1000);
+        if (t->wait_hint)
+            fprintf(stderr, "        %s\n", t->wait_hint);
         return ODIN_ERR_IO;
     }
     return ODIN_OK;
@@ -95,7 +97,7 @@ static int ser_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
      * staring at a silent console needs to be told that we are still trying
      * rather than left to assume the driver hung. */
     size_t off = 0;
-    int waited = 0, noted = 0;
+    int waited = 0, next_note = IO_NOTE_MS;
     while (off < len) {
         int budget = timeout_ms - waited;
         if (budget <= 0) break;
@@ -104,14 +106,14 @@ static int ser_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
         int r = poll(&p, 1, ask);
         if (r == 0) {
             waited += ask;
-            if (!noted && waited >= IO_NOTE_MS) {
+            if (waited >= next_note) {
                 fprintf(stderr, "[io] still waiting for %s (%zu of %zu bytes) "
                         "after %d s...\n",
                         t->wait_label ? t->wait_label : "the device",
                         off, len, waited / 1000);
                 if (t->wait_hint)
                     fprintf(stderr, "        %s\n", t->wait_hint);
-                noted = 1;
+                next_note = waited + IO_REPEAT_MS;
             }
             continue;
         }
@@ -127,13 +129,15 @@ static int ser_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
         if (n == 0) return ODIN_ERR_IO;
         off += (size_t)n;
         waited = 0;
-        noted = 0;              /* progress restarts the budget, as it does for Odin */
+        next_note = IO_NOTE_MS;  /* progress restarts the budget and the schedule */
     }
     if (off < len) {
         fprintf(stderr, "[io] no data from %s after %d s (Odin allows %d s) "
                         "- giving up\n",
                 t->wait_label ? t->wait_label : "the device",
                 timeout_ms / 1000, ODIN_READ_TIMEOUT_MS / 1000);
+        if (t->wait_hint)
+            fprintf(stderr, "        %s\n", t->wait_hint);
         return ODIN_ERR_IO;
     }
     return ODIN_OK;
@@ -214,7 +218,7 @@ static int usb_write_all(odin_transport *t, const uint8_t *buf, size_t len)
 {
     struct usb_state *s = t->usb;
     size_t off = 0;
-    int waited = 0, noted = 0;
+    int waited = 0, next_note = IO_NOTE_MS;
     while (off < len) {
         int budget = ODIN_WRITE_TIMEOUT_MS - waited;
         if (budget <= 0) break;
@@ -225,14 +229,14 @@ static int usb_write_all(odin_transport *t, const uint8_t *buf, size_t len)
                                       (int)(len - off), &n, ask);
         if (rc == LIBUSB_ERROR_TIMEOUT) {
             waited += ask;
-            if (!noted && waited >= IO_NOTE_MS) {
+            if (waited >= next_note) {
                 fprintf(stderr, "[io] still writing to the device (%zu of %zu "
                         "bytes) after %d s%s%s\n", off, len, waited / 1000,
                         t->wait_label ? " - " : "",
                         t->wait_label ? t->wait_label : "");
                 if (t->wait_hint)
                     fprintf(stderr, "        %s\n", t->wait_hint);
-                noted = 1;
+                next_note = waited + IO_REPEAT_MS;
             }
             continue;
         }
@@ -244,12 +248,14 @@ static int usb_write_all(odin_transport *t, const uint8_t *buf, size_t len)
         if (n <= 0) return ODIN_ERR_IO;
         off += (size_t)n;
         waited = 0;
-        noted = 0;
+        next_note = IO_NOTE_MS;
     }
     if (off < len) {
         fprintf(stderr, "[io] the device stopped accepting data after %d s "
                         "(Odin allows %d s) - giving up\n",
                 ODIN_WRITE_TIMEOUT_MS / 1000, ODIN_WRITE_TIMEOUT_MS / 1000);
+        if (t->wait_hint)
+            fprintf(stderr, "        %s\n", t->wait_hint);
         return ODIN_ERR_IO;
     }
     return ODIN_OK;
@@ -261,7 +267,7 @@ static int usb_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
      * budget, but say something before a long silent wait looks like a hang. */
     struct usb_state *s = t->usb;
     size_t off = 0;
-    int waited = 0, noted = 0;
+    int waited = 0, next_note = IO_NOTE_MS;
     while (off < len) {
         int budget = timeout_ms - waited;
         if (budget <= 0) break;
@@ -272,14 +278,14 @@ static int usb_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
                                       (int)(len - off), &n, ask);
         if (rc == LIBUSB_ERROR_TIMEOUT) {
             waited += ask;
-            if (!noted && waited >= IO_NOTE_MS) {
+            if (waited >= next_note) {
                 fprintf(stderr, "[io] still waiting for %s (%zu of %zu bytes) "
                         "after %d s...\n",
                         t->wait_label ? t->wait_label : "the device",
                         off, len, waited / 1000);
                 if (t->wait_hint)
                     fprintf(stderr, "        %s\n", t->wait_hint);
-                noted = 1;
+                next_note = waited + IO_REPEAT_MS;
             }
             continue;
         }
@@ -291,13 +297,15 @@ static int usb_read_all(odin_transport *t, uint8_t *buf, size_t len, int timeout
         if (n <= 0) return ODIN_ERR_IO;
         off += (size_t)n;
         waited = 0;
-        noted = 0;              /* progress restarts the budget, as it does for Odin */
+        next_note = IO_NOTE_MS;  /* progress restarts the budget and the schedule */
     }
     if (off < len) {
         fprintf(stderr, "[io] no data from %s after %d s (Odin allows %d s) "
                         "- giving up\n",
                 t->wait_label ? t->wait_label : "the device",
                 timeout_ms / 1000, ODIN_READ_TIMEOUT_MS / 1000);
+        if (t->wait_hint)
+            fprintf(stderr, "        %s\n", t->wait_hint);
         return ODIN_ERR_IO;
     }
     return ODIN_OK;

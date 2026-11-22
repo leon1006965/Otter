@@ -140,10 +140,20 @@ Two rules the GUI enforces on top of the CLI:
 
 Because the driver waits Odin's own 300 s for a response, **Start turns into
 Stop** while a command runs: a phone that has gone quiet would otherwise hold
-the window for minutes with no way out. Interrupting mid-write is safe — the
-driver sends no further command, the phone keeps the bytes it already has and
-stays in Download mode, which is exactly the state a failed run leaves. An
-interrupt is logged as a choice, never as a failure.
+the window for minutes with no way out. Interrupting mid-write leaves the phone
+with the bytes it already has, still in Download mode, and with no further
+command sent — an interrupt is logged as a choice, never as a failure.
+
+It does **not** guarantee the phone is immediately ready to accept a new run: an
+aborted bulk transfer can strand its OUT endpoint until Download mode is
+re-entered (see "A phone that will not accept data at all" below). That is why
+Stop tells you to re-enter before retrying.
+
+Long waits are reported rather than sitting silent — after 15 s the log says
+what is pending and repeats every 60 s. The GUI mirrors it in the status line
+and switches the bar to `waiting…` while keeping the fraction and the exact
+byte count, so *progressing slowly* and *stopped answering* stay
+distinguishable.
 
 Layout note: the plan/safety/log sizes are calibrated so nothing important is
 hidden behind a desktop panel on a 768 px-tall screen — if you change
@@ -296,9 +306,26 @@ power-cycling and re-entering Download mode does.
 
 Because Odin allows a full 300 s for that handshake (§17 of the RE notes), a
 phone with a spent session is silent rather than quick to refuse. The driver
-waits the same window, but says so after about 15 s and explains that
-continued silence almost always means the session is spent — so you can
-interrupt instead of watching a progress-free console for five minutes.
+waits the same window, but says so after about 15 s — repeating every 60 s until
+the budget runs out — and explains what the silence means, so you can interrupt
+instead of watching a progress-free console for five minutes.
+
+### A phone that will not accept data at all
+
+If the handshake fails on the **write** — `could not send "ODIN"` — the phone
+enumerated correctly but never took the 4 bytes, so nothing was delivered and
+**no session was opened**. This is a different fault from a spent session, and
+the driver reports it separately rather than sending you to the wrong fix.
+
+The usual cause is an aborted transfer: interrupting a run, or a timeout firing
+mid-write, leaves the phone waiting for the rest of a bulk transfer it will
+never receive. It then NAKs everything on its OUT endpoint even though it still
+enumerates normally — `list` will keep showing `04e8:685d`, because only the
+data path is stuck. Remedies, in order:
+
+1. **Re-enter Download mode** — guaranteed, and required if it persists.
+2. `odin3-linux flash … --usb-reset` — clears a wedged endpoint first; it does
+   not touch flash contents.
 
 So the workflow is three steps:
 
