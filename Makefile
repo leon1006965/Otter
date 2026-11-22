@@ -27,8 +27,9 @@ install: odin3-linux
 # Offline tests only - no phone required.
 test: odin3-linux
 	python3 tests/make_fixtures.py >/dev/null
-	@for t in test bad zerodiv crit big lz4; do \
-		f=tests/$$t.tar; exp=OK; [ $$t = test ] || exp=NO; \
+	@for t in test bad zerodiv crit big lz4 lz4legacy lz4name md5; do \
+		f=tests/$$t.tar; [ -f "$$f" ] || f=tests/$$t.tar.md5; \
+		exp=OK; case $$t in test|md5) exp=OK;; *) exp=NO;; esac; \
 		if ./odin3-linux plan --ap $$f --pit tests/test.pit >/dev/null 2>&1; then got=OK; else got=NO; fi; \
 		if [ "$$exp" = "$$got" ]; then echo "  pass  $$t.tar ($$got)"; \
 		else echo "  FAIL  $$t.tar expected $$exp got $$got"; exit 1; fi; \

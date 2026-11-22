@@ -104,3 +104,17 @@ if __name__ == '__main__':
     build_tar(os.path.join(OUT, 'lz4.tar'), [
         ('boot.img',     b'\x04\x22\x4d\x18' + b'\x00' * 60),
     ])
+    # LZ4 legacy container magic (a different variant) - must also refuse
+    build_tar(os.path.join(OUT, 'lz4legacy.tar'), [
+        ('boot.img',     b'\x02\x21\x4c\x18' + b'\x00' * 60),
+    ])
+    # a plain payload but a .lz4 name: Samsung ships them this way
+    build_tar(os.path.join(OUT, 'lz4name.tar'), [
+        ('system.img.lz4', b'S' * 100),
+    ])
+    # same content as test.tar but named the way real firmware is distributed
+    build_tar(os.path.join(OUT, 'md5.tar.md5'), [
+        ('boot.img',     b'B' * 3000),
+        ('system.img',   b'S' * 700000),
+        ('meta-data/x',  b'm' * 100),
+    ])

@@ -651,18 +651,40 @@ static int gate_no_compressed_members(void)
 {
     for (size_t i = 0; i < g_map_count; i++) {
         const mapped_item *it = &g_map[i];
-        uint8_t mag[4];
-        ssize_t n = pread(g_slots[it->slot].tar.fd, mag, 4,
-                          (off_t)it->member->data_offset);
-        if (n == 4 && mag[0] == 0x04 && mag[1] == 0x22 &&
-            mag[2] == 0x4D && mag[3] == 0x18) {
+        const char *nm = it->member->name;
+        size_t nlen = strlen(nm);
+
+        /* Samsung ships compressed members as *.lz4 inside the tar.  Check the
+         * name first - that is the common case and needs no guessing. */
+        if (nlen >= 4 && strcasecmp(nm + nlen - 4, ".lz4") == 0) {
             snprintf(g_err, sizeof(g_err),
-                     "\"%s\" starts with the LZ4 frame magic; Odin decompresses "
-                     "these members before sending (FUN_1001bad0) but this driver "
-                     "does not, so flashing it would write compressed garbage - "
-                     "refusing",
-                     it->member->name);
+                     "\"%s\" is an LZ4-compressed member; Odin decompresses "
+                     "these before sending (FUN_1001bad0) but this driver does "
+                     "not, so flashing it would write compressed garbage - "
+                     "refusing", nm);
             return ODIN_ERR_FORMAT;
+        }
+
+        /* Then the payload itself, so a renamed or differently-suffixed
+         * compressed member is caught too.  All three LZ4 container magics. */
+        static const uint8_t lz4magic[][4] = {
+            {0x04, 0x22, 0x4D, 0x18},   /* LZ4 frame      0x184D2204 */
+            {0x02, 0x21, 0x4C, 0x18},   /* LZ4 legacy     0x184C2102 */
+            {0x60, 0x2A, 0x4D, 0x18},   /* LZ4 skippable  0x184D2A60 */
+        };
+        uint8_t mag[4];
+        if (pread(g_slots[it->slot].tar.fd, mag, 4,
+                  (off_t)it->member->data_offset) != 4)
+            continue;
+        for (size_t k = 0; k < sizeof lz4magic / sizeof lz4magic[0]; k++) {
+            if (memcmp(mag, lz4magic[k], 4) == 0) {
+                snprintf(g_err, sizeof(g_err),
+                         "\"%s\" starts with an LZ4 container magic; Odin "
+                         "decompresses these before sending (FUN_1001bad0) but "
+                         "this driver does not, so flashing it would write "
+                         "compressed garbage - refusing", nm);
+                return ODIN_ERR_FORMAT;
+            }
         }
     }
     return ODIN_OK;
