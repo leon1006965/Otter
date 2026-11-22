@@ -249,6 +249,27 @@ def main():
         check("CANCEL stops before any phone contact", win.kind == "preflight",
               win.kind)
 
+        # A full firmware is tens of rows; the dialog must build its scrollable
+        # list without raising (the <=6-row branch is a plain label instead).
+        dialogs[:] = []
+        names = [("boot.img", "BOOT"), ("dtbo.img", "DTBO"),
+                 ("vbmeta.img", "VBMETA"), ("super.img", "SUPER"),
+                 ("recovery.img", "RECOVERY"), ("modem.bin", "RADIO"),
+                 ("misc.img", "MISC"), ("ssp.img", "SSP"),
+                 ("tzsw.img", "TZSW"), ("ldfw.img", "LDFW"),
+                 ("cache.img", "CACHE"), ("omr.img", "OMR")]
+        win.plan_rows = [["AP", n, "8", p, str(1000000 + i), "67108864",
+                          "31457280"] for i, (n, p) in enumerate(names)]
+        try:
+            win._ask_then_flash()
+            built = True
+        except Exception as e:                       # pragma: no cover
+            built = False
+            print("      dialog build raised: %r" % e)
+        check("12-row plan builds the scrollable confirm dialog",
+              built and len(dialogs) == 1, str(dialogs))
+        dialogs[:] = []
+
     # ---- 7b. the popups that explain the one-session rule ----------------
     dialogs[:] = []
     win.kind = "probe"

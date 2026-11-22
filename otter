@@ -672,20 +672,50 @@ class Otter(Gtk.Window):
             self._ask_then_flash()
 
     def _ask_then_flash(self):
+        """Show exactly what will be written, then ask.
+
+        Every plan row is listed as `member -> PARTITION (bytes)` - with a
+        full firmware that is tens of rows, and Gtk.MessageDialog does not
+        scroll, so past a handful the list goes into a capped scroll view
+        instead of running off the bottom of the screen.
+        """
         rows = self.plan_rows
         if rows:
             body = "\n".join("%s  ->  %s   (%s bytes)"
                              % (r[1], r[3], f"{int(r[4]):,}") for r in rows)
+            summary = "%d file(s) -> %d partition(s)" % (
+                len(rows), len({r[3] for r in rows}))
         else:
             body = "\n".join(os.path.basename(p) for p in _paths(self))
-            body += "\n\n(no saved device PIT, so no partition preview)"
+            summary = "no saved device PIT, so no partition preview"
+
         dlg = Gtk.MessageDialog(transient_for=self, modal=True,
                                 message_type=Gtk.MessageType.WARNING,
                                 buttons=Gtk.ButtonsType.OK_CANCEL)
         dlg.set_title("Start flash")
         dlg.set_markup("<b>Write to %s ?</b>\n\n%s\n\n"
                        "The phone must be in Download mode."
-                       % (esc(self.identity), esc(body)))
+                       % (esc(self.identity), esc(summary)))
+
+        if len(rows) > 6:
+            sw = Gtk.ScrolledWindow()
+            sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            sw.set_propagate_natural_height(True)
+            sw.set_min_content_height(22 * min(len(rows), 6))
+            sw.set_max_content_height(320)
+            tv = Gtk.TextView()
+            tv.set_editable(False)
+            tv.set_cursor_visible(False)
+            tv.set_monospace(True)
+            tv.get_buffer().set_text(body)
+            sw.add(tv)
+            dlg.get_message_area().pack_start(sw, True, True, 0)
+        else:
+            lbl = Gtk.Label(label=body, xalign=0, selectable=True)
+            lbl.set_justify(Gtk.Justification.LEFT)
+            dlg.get_message_area().pack_start(lbl, False, False, 0)
+
+        dlg.show_all()
         if dlg.run() != Gtk.ResponseType.OK:
             dlg.destroy()
             self._set_status("cancelled - nothing was written")
