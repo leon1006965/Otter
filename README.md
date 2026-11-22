@@ -1,5 +1,16 @@
 # Otter
 
+**Install — paste this into a terminal:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/leon1006965/Otter/main/setup.sh | sh
+```
+
+It detects your distro, installs whatever is missing, builds the driver and
+puts `otter` on your PATH. Then open a **new terminal** and type **`otter`**.
+
+---
+
 A Linux driver for the Samsung **Odin download mode** protocol, derived by
 reverse engineering `Odin3_v3.14.4.exe` / `SS_DL.dll` (3.14.4), plus a GTK3
 front end laid out like Odin3 itself.
